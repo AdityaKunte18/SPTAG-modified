@@ -4,6 +4,7 @@
 #ifndef _SPTAG_METADATASET_H_
 #define _SPTAG_METADATASET_H_
 
+#include "inc/Helper/DiskIO.h"
 #include "CommonDataStructure.h"
 
 namespace SPTAG

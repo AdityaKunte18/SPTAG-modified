@@ -44,12 +44,14 @@ namespace SPTAG
             {
                 if (key >= R())
                 {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "LabelSet::Contains: key %lld out of range %lld\n", (long long)key, (long long)R());
                     switch (m_invalidIDBehaviorSetting)
                     {
                         case InvalidIDBehavior::AlwaysContains:
                             return true;
                         case InvalidIDBehavior::AlwaysNotContains:
                             return false;
+			default: {}
                     }
                 }
 
@@ -60,18 +62,41 @@ namespace SPTAG
             {
                 if (key >= R())
                 {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "LabelSet::Insert: key %lld out of range %lld\n", (long long)key, (long long)R());
                     switch (m_invalidIDBehaviorSetting)
                     {
                         case InvalidIDBehavior::AlwaysContains:
                             return true;
                         case InvalidIDBehavior::AlwaysNotContains:
                             return false;
+			default: {}
                     }
                 }
 
                 char oldvalue = InterlockedExchange8((char*)m_data[key], 1);
                 if (oldvalue == 1) return false;
                 m_inserted++;
+                return true;
+            }
+
+            inline bool Reset(const SizeType& key)
+            {
+                if (key >= R())
+                {
+                    SPTAGLIB_LOG(Helper::LogLevel::LL_Error, "LabelSet::Insert: key %lld out of range %lld\n",
+                                 (long long)key, (long long)R());
+                    switch (m_invalidIDBehaviorSetting)
+                    {
+                    case InvalidIDBehavior::AlwaysContains:
+                        return true;
+                    case InvalidIDBehavior::AlwaysNotContains:
+                        return false;
+                    default: {}
+                    }
+                }
+                char oldvalue = InterlockedExchange8((char *)m_data[key], -1);
+                if (oldvalue == -1) return false;
+                m_inserted--;
                 return true;
             }
 

@@ -43,6 +43,8 @@ namespace SPTAG {
             bool m_deleteHeadVectors;
             int m_ssdIndexFileNum;
             std::string m_quantizerFilePath;
+            int m_datasetRowsInBlock;
+            int m_datasetCapacity;
 
             // Section 2: for selecting head
             bool m_selectHead;
@@ -68,9 +70,6 @@ namespace SPTAG {
             bool m_recursiveCheckSmallCluster;
             bool m_printSizeCount;
             std::string m_selectType;
-            // Dataset constructor args
-            int m_datasetRowsInBlock;
-            int m_datasetCapacity;
 
             // Section 3: for build head
             bool m_buildHead;
@@ -98,6 +97,17 @@ namespace SPTAG {
             int m_samples;
             bool m_excludehead;
             int m_postingVectorLimit;
+            std::string m_fullDeletedIDFile;
+            Storage m_storage;
+            std::string m_KVFile;
+            std::string m_ssdMappingFile;
+            std::string m_ssdInfoFile;
+            std::string m_checksumFile;
+            bool m_useDirectIO;
+            bool m_preReassign;
+            float m_preReassignRatio;
+            bool m_enableWAL;
+            bool m_disableCheckpoint;
 
             // GPU building
             int m_gpuSSDNumTrees;
@@ -123,8 +133,67 @@ namespace SPTAG {
             bool m_enableADC;
             int m_iotimeout;
 
+            int m_searchThreadNum;
+
+            // Calculating
+            std::string m_truthFilePrefix;
+            bool m_calTruth;
+            bool m_calAllTruth;
+            int m_searchTimes;
+            int m_minInternalResultNum;
+            int m_stepInternalResultNum;
+            int m_maxInternalResultNum;
+            bool m_onlySearchFinalBatch;
+
+            // Updating
+            bool m_disableReassign;
+            bool m_searchDuringUpdate;
+            int m_reassignK;
+            bool m_recovery;
+
+            // Updating(SPFresh Update Test)
+            bool m_update;
+            bool m_inPlace;
+            bool m_outOfPlace;
+            float m_latencyLimit;
+            int m_step;
+            int m_insertThreadNum;
+            int m_endVectorNum;
+            std::string m_persistentBufferPath;
+            int m_appendThreadNum;
+            int m_reassignThreadNum;
+            int m_batch;
+            std::string m_fullVectorPath;
+
+            // Steady State Update
+            std::string m_updateFilePrefix;
+            std::string m_updateMappingPrefix;
+            int m_days;
+            int m_deleteQPS;
+            int m_sampling;
+            bool m_showUpdateProgress;
+            int m_mergeThreshold;
+            bool m_loadAllVectors;
+            bool m_steadyState;
+            int m_spdkBatchSize;
+            bool m_stressTest;
+            int m_bufferLength;
+            int m_maxFileSize;
+            int m_startFileSize;
+            int m_growthFileSize;
+            float m_growThreshold;
+            float m_fDeletePercentageForRefine;
+            bool m_oneClusterCutMax;
+            bool m_consistencyCheck;
+            bool m_checksumCheck;
+            bool m_checksumInRead;
+            int m_cacheSize;
+            int m_cacheShards;
+            
             // Iterative
             int m_headBatch;
+            int m_asyncAppendQueueSize;
+            bool m_allowZeroReplica;
 
             Options() {
 #define DefineBasicParameter(VarName, VarType, DefaultValue, RepresentStr) \

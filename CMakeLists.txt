@@ -1,4 +1,4 @@
-# Copyright (c) Microsoft Corporation. All rights reserved.
+﻿# Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
 cmake_minimum_required (VERSION 3.12)
@@ -18,15 +18,22 @@ if(NOT WIN32)
     CXX_COMPILER_DUMPVERSION(CXX_COMPILER_VERSION)
 endif()
 
+option(USE_ASAN "Enable AddressSanitizer (ASAN) for memory debugging" OFF)
+
 if(${CMAKE_CXX_COMPILER_ID} STREQUAL "GNU")
     # require at least gcc 5.0
     if (CXX_COMPILER_VERSION VERSION_LESS 5.0)
         message(FATAL_ERROR "GCC version must be at least 5.0!")
     endif()
-    set (CMAKE_CXX_FLAGS "-Wall -Wunreachable-code -Wno-reorder -Wno-delete-non-virtual-dtor -Wno-sign-compare -Wno-unknown-pragmas -Wcast-align -lm -lrt -std=c++14 -fopenmp")
+    set (CMAKE_CXX_FLAGS "-Wall -Wunreachable-code -Wno-reorder -Wno-pessimizing-move -Wno-delete-non-virtual-dtor -Wno-sign-compare -Wno-unknown-pragmas -Wcast-align -lm -lrt -std=c++17 -fopenmp")
     set (CMAKE_CXX_FLAGS_RELEASE "-DNDEBUG -O3 -march=native")
     set (CMAKE_CXX_FLAGS_DEBUG   "-g -DDEBUG")
 
+    if(USE_ASAN)
+        message(STATUS "ASAN is enabled")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
+        set(CMAKE_LINKER_FLAGS "${CMAKE_LINKER_FLAGS} -fsanitize=address")
+    endif()
 
     find_path(NUMA_INCLUDE_DIR NAME numa.h
       HINTS $ENV{HOME}/local/include /opt/local/include /usr/local/include /usr/include)
@@ -56,7 +63,8 @@ elseif(WIN32)
          message(FATAL_ERROR "On Windows, only MSVC version 14 are supported!") 
     endif()
     set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /std:c++14")
-
+    set (NUMA_LIBRARY "")
+    set (NUMA_LIBRARY_STATIC "")
     message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
 else ()
     message(FATAL_ERROR "Unrecognized compiler (use GCC or MSVC)!")
@@ -115,8 +123,60 @@ else()
     message (FATAL_ERROR "Could not find Boost >= 1.67!")
 endif()
 
-option(GPU "GPU" ON)
+option(GPU "GPU" OFF)
 option(LIBRARYONLY "LIBRARYONLY" OFF)
+option(ROCKSDB "ROCKSDB" OFF)
+option(SPDK "SPDK" OFF)
+option(TBB "TBB" ON)
+option(URING "URING" OFF)
+
+if (URING)
+    find_path(uring_INCLUDE_DIR NAMES liburing.h)
+    find_library(uring_LIBRARIES NAMES liburing.a liburing)
+
+    if (uring_INCLUDE_DIR AND uring_LIBRARIES)
+        add_library(uring::uring INTERFACE IMPORTED)
+        set_target_properties(uring::uring PROPERTIES
+            INTERFACE_LINK_LIBRARIES "${uring_LIBRARIES}"
+            INTERFACE_INCLUDE_DIRECTORIES "${uring_INCLUDE_DIR}"
+        )
+        add_definitions(-DURING)
+        set(uring_LIBRARIES uring::uring)
+        message (STATUS "Found uring ${uring_LIBRARIES}")
+    else()
+        message (FATAL_ERROR "Could not find uring!")
+    endif()
+else()
+    set(uring_LIBRARIES "")
+endif()
+
+
+set(RocksDB_LIBRARIES "")
+if (ROCKSDB)
+    find_package(RocksDB CONFIG)
+    if((DEFINED RocksDB_DIR) AND RocksDB_DIR)
+        list(APPEND RocksDB_LIBRARIES RocksDB::rocksdb)
+        add_definitions(-DROCKSDB)
+	    message (STATUS "Found RocksDB ${RocksDB_VERSION} ${RocksDB_LIBRARIES}")
+        message (STATUS "RocksDB: ${RocksDB_DIR}")
+    else()
+        set(RocksDB_LIBRARIES "")
+        set(uring_LIBRARIES "")
+        message (FATAL_ERROR "Could not find RocksDB!")
+    endif()
+endif()
+
+set (TBB_LIBRARIES "")
+if (TBB)
+    find_package(TBB REQUIRED)
+    if (TBB_FOUND)
+        list(APPEND TBB_LIBRARIES tbb)
+        add_definitions(-DTBB)
+	message (STATUS "Found TBB ${TBB_LIBRARIES}")
+    else()
+        message (FATAL_ERROR "Could not find TBB!")
+    endif()
+endif()
 
 add_subdirectory (ThirdParty/zstd/build/cmake)
 

@@ -202,7 +202,7 @@
     <ClInclude Include="inc\Core\SPANN\Options.h">
       <Filter>Header Files\Core\SPANN</Filter>
     </ClInclude>
-    <ClInclude Include="inc\Core\SPANN\ExtraFullGraphSearcher.h">
+    <ClInclude Include="inc\Core\SPANN\ExtraStaticSearcher.h">
       <Filter>Header Files\Core\SPANN</Filter>
     </ClInclude>
     <ClInclude Include="inc\Helper\AsyncFileReader.h">
@@ -226,8 +226,47 @@
     <ClInclude Include="inc\Core\Common\SIMDUtils.h">
       <Filter>Header Files\Core\Common</Filter>
     </ClInclude>
+    <ClInclude Include="inc\Core\SPANN\ExtraRocksDBController.h">
+      <Filter>Header Files\Core\SPANN</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\Core\SPANN\ExtraDynamicSearcher.h">
+      <Filter>Header Files\Core\SPANN</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\Helper\KeyValueIO.h">
+      <Filter>Header Files\Helper</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\Core\Common\VersionLabel.h">
+      <Filter>Header Files\Core\Common</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\Core\SPANN\ExtraSPDKController.h">
+      <Filter>Header Files\Core\SPANN</Filter>
+    </ClInclude>
     <ClInclude Include="inc\Core\SPANN\SPANNResultIterator.h">
       <Filter>Header Files\Core\SPANN</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\Core\SPANN\ExtraRocksDBController.h">
+      <Filter>Header Files\Core\SPANN</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\Core\SPANN\ExtraDynamicSearcher.h">
+      <Filter>Header Files\Core\SPANN</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\Helper\KeyValueIO.h">
+      <Filter>Header Files\Helper</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\Core\Common\VersionLabel.h">
+      <Filter>Header Files\Core\Common</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\Core\SPANN\ExtraSPDKController.h">
+      <Filter>Header Files\Core\SPANN</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\Core\SPANN\ExtraFileController.h">
+      <Filter>Header Files\Core\SPANN</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\Core\Common\PostingSizeRecord.h">
+      <Filter>Header Files\Core\Common</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\Core\Common\Checksum.h">
+      <Filter>Header Files\Core\Common</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -308,6 +347,12 @@
     </ClCompile>
     <ClCompile Include="src\Helper\AsyncFileReader.cpp">
       <Filter>Source Files\Helper</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Core\SPANN\ExtraFileController.cpp">
+      <Filter>Source Files\Core\SPANN</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Core\SPANN\ExtraSPDKController.cpp">
+      <Filter>Source Files\Core\SPANN</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>

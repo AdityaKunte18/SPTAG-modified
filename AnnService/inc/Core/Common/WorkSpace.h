@@ -9,6 +9,7 @@
 #include "Heap.h"
 
 #include <stdarg.h>
+#include <functional>
 
 namespace SPTAG
 {
@@ -74,7 +75,7 @@ namespace SPTAG
         public:
             OptHashPosVector(): m_secondHash(false), m_exp(2), m_poolSize(8191) {}
 
-            ~OptHashPosVector() {}
+            ~OptHashPosVector() { m_hashTable.reset(); }
 
 
             void Init(SizeType size, int exp)
@@ -173,6 +174,8 @@ namespace SPTAG
         public:
             DistPriorityQueue(): m_size(0), m_length(0), m_count(0) {}
 
+            ~DistPriorityQueue() { m_data.reset(); }
+
             void Resize(int size_) {
                 m_size = size_;
                 m_data.reset(new float[size_ + 1]);
@@ -237,7 +240,7 @@ namespace SPTAG
             }
 
             ~WorkSpace() {
-                SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Delete workspace happens!\n");
+                //SPTAGLIB_LOG(Helper::LogLevel::LL_Info, "Delete workspace happens!\n");
             }
 
             void Initialize(int maxCheck, int hashExp)
@@ -300,12 +303,12 @@ namespace SPTAG
             OptHashPosVector nodeCheckStatus;
 
             // counter for dynamic pivoting
-            int m_iNumOfContinuousNoBetterPropagation;
-            int m_iContinuousLimit;
-            int m_iNumberOfTreeCheckedLeaves;
-            int m_iNumberOfCheckedLeaves;
-            int m_iMaxCheck;
-            bool m_relaxedMono;
+            int m_iNumOfContinuousNoBetterPropagation = 0;
+            int m_iContinuousLimit = 128;
+            int m_iNumberOfTreeCheckedLeaves = 0;
+            int m_iNumberOfCheckedLeaves = 0;
+            int m_iMaxCheck = 8192;
+            bool m_relaxedMono = false;
 
             // Prioriy queue used for neighborhood graph
             Heap<NodeDistPair> m_NGQueue;
@@ -317,6 +320,7 @@ namespace SPTAG
             Heap<NodeDistPair> m_nextBSPTQueue;
 
             DistPriorityQueue m_Results;
+            std::function<bool(const ByteArray&)> m_filterFunc;
         };
     }
 }

@@ -2,25 +2,26 @@
 
 #define BOOST_TEST_MODULE GPU
 
-#include <cstdlib>
 #include <chrono>
+#include <cstdlib>
 
-#include <iostream>
-#include <boost/test/included/unit_test.hpp>
 #include <boost/filesystem.hpp>
+#include <boost/test/included/unit_test.hpp>
+#include <iostream>
 
 int GPUBuildKNNTest();
 
-BOOST_AUTO_TEST_CASE(RandomTests) {
-  BOOST_CHECK(1 == 1);
+BOOST_AUTO_TEST_CASE(RandomTests)
+{
+    BOOST_CHECK(1 == 1);
 
-  int errors = GPUBuildKNNTest();
-printf("outside\n");
-  BOOST_CHECK(errors == 0);
+    int errors = GPUBuildKNNTest();
+    printf("outside\n");
+    BOOST_CHECK(errors == 0);
 }
 
 /*
-int GPUTestDistance_All(); 
+int GPUTestDistance_All();
 
 BOOST_AUTO_TEST_CASE(DistanceTests) {
   int errs = GPUTestDistance_All();

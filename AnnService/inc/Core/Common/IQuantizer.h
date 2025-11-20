@@ -5,6 +5,7 @@
 #define _SPTAG_COMMON_QUANTIZER_H_
 
 #include "inc/Core/Common.h"
+#include "inc/Helper/DiskIO.h"
 #include <cstdint>
 #include "inc/Core/CommonDataStructure.h"
 #include "DistanceUtils.h"

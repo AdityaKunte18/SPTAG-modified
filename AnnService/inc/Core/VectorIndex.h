@@ -4,21 +4,22 @@
 #ifndef _SPTAG_VECTORINDEX_H_
 #define _SPTAG_VECTORINDEX_H_
 
+#include <unordered_set>
 #include "Common.h"
 #include "Common/WorkSpace.h"
+#include "inc/Helper/DiskIO.h"
 #include "SearchQuery.h"
 #include "VectorSet.h"
 #include "MetadataSet.h"
 #include "inc/Helper/SimpleIniReader.h"
-#include <unordered_set>
 #include "inc/Core/Common/IQuantizer.h"
-#include "inc/Core/Common/WorkSpace.h"
 
 class ResultIterator;
 
 namespace SPTAG
 {
 
+extern std::shared_ptr<Helper::DiskIO>(*f_createIO)();
 class IAbortOperation
 {
 public:
@@ -35,12 +36,15 @@ public:
     virtual ErrorCode BuildIndex(const void* p_data, SizeType p_vectorNum, DimensionType p_dimension, bool p_normalized = false, bool p_shareOwnership = false) = 0;
     
     virtual ErrorCode AddIndex(const void* p_data, SizeType p_vectorNum, DimensionType p_dimension, std::shared_ptr<MetadataSet> p_metadataSet, bool p_withMetaIndex = false, bool p_normalized = false) = 0;
+    virtual ErrorCode AddIndexId(const void* p_data, SizeType p_vectorNum, DimensionType p_dimension, int& beginHead, int& endHead) { return ErrorCode::Undefined; }
+    virtual ErrorCode AddIndexIdx(SizeType begin, SizeType end) { return ErrorCode::Undefined; }
+
 
     virtual ErrorCode DeleteIndex(const void* p_vectors, SizeType p_vectorNum) = 0;
 
     virtual ErrorCode SearchIndex(QueryResult& p_results, bool p_searchDeleted = false) const = 0;
     
-    virtual std::shared_ptr<ResultIterator> GetIterator(const void* p_target, bool p_searchDeleted = false) const = 0;
+    virtual std::shared_ptr<ResultIterator> GetIterator(const void* p_target, bool p_searchDeleted = false, std::function<bool(const ByteArray&)> p_filterFunc = nullptr, int p_maxCheck = 0) const = 0;
 
     virtual ErrorCode SearchIndexIterativeNext(QueryResult& p_query, COMMON::WorkSpace* workSpace, int p_batch, int& resultCount, bool p_isFirst, bool p_searchDeleted) const = 0;
 
@@ -48,7 +52,7 @@ public:
 
     virtual bool SearchIndexIterativeFromNeareast(QueryResult& p_query, COMMON::WorkSpace* p_space, bool p_isFirst, bool p_searchDeleted = false) const = 0;
 
-    virtual std::unique_ptr<COMMON::WorkSpace> RentWorkSpace(int batch) const = 0;
+    virtual std::unique_ptr<COMMON::WorkSpace> RentWorkSpace(int batch, std::function<bool(const ByteArray&)> p_filterFunc = nullptr, int p_maxCheck = 0) const = 0;
 
     virtual ErrorCode RefineSearchIndex(QueryResult &p_query, bool p_searchDeleted = false) const = 0;
 
@@ -164,6 +168,8 @@ public:
 
     static std::uint64_t EstimatedMemoryUsage(std::uint64_t p_vectorCount, DimensionType p_dimension, VectorValueType p_valuetype, SizeType p_vectorsInBlock, SizeType p_maxmeta, IndexAlgoType p_algo, int p_treeNumber, int p_neighborhoodSize);
 
+    virtual std::shared_ptr<VectorIndex> Clone(std::string p_clone);
+
     virtual std::shared_ptr<std::vector<std::uint64_t>> BufferSize() const = 0;
 
     virtual std::shared_ptr<std::vector<std::string>> GetIndexFiles() const = 0;
@@ -180,7 +186,7 @@ public:
 
     virtual ErrorCode DeleteIndex(const SizeType& p_id) = 0;
 
-    virtual ErrorCode RefineIndex(const std::vector<std::shared_ptr<Helper::DiskIO>>& p_indexStreams, IAbortOperation* p_abort) = 0;
+    virtual ErrorCode RefineIndex(const std::vector<std::shared_ptr<Helper::DiskIO>>& p_indexStreams, IAbortOperation* p_abort, std::vector<SizeType>* p_mapping) = 0;
 
     virtual ErrorCode SetWorkSpaceFactory(std::unique_ptr<SPTAG::COMMON::IWorkSpaceFactory<SPTAG::COMMON::IWorkSpace>> up_workSpaceFactory) = 0;
 
@@ -192,7 +198,14 @@ public:
 
     void BuildMetaMapping(bool p_checkDeleted = true);
 
-private:
+    virtual ErrorCode Check()
+    {
+        return ErrorCode::Undefined;
+    }
+
+    virtual std::string GetPriorityID(int queryID) const { return ""; }
+    
+  private:
     ErrorCode LoadIndexConfig(Helper::IniReader& p_reader);
 
     ErrorCode SaveIndexConfig(std::shared_ptr<Helper::DiskIO> p_configOut);

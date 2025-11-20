@@ -5,16 +5,25 @@
 #define _SPTAG_HELPER_CONCURRENTSET_H_
 
 #ifndef _MSC_VER
+#ifdef TBB
+#include <tbb/concurrent_unordered_map.h>
+#include <tbb/concurrent_queue.h>
+#include <tbb/concurrent_unordered_set.h>
+#include <tbb/concurrent_priority_queue.h>
+#else
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_set>
 #include <unordered_map>
 #include <queue>
+#endif // TBB
 #else
 #include <concurrent_unordered_map.h>
 #include <concurrent_queue.h>
 #include <concurrent_unordered_set.h>
-#endif
+#include <concurrent_priority_queue.h>
+#endif // _MSC_VER
+
 namespace SPTAG
 {
     namespace Helper
@@ -22,9 +31,24 @@ namespace SPTAG
         namespace Concurrent
         {
 #ifndef _MSC_VER
+#ifdef TBB
+            template <typename T>
+            using ConcurrentSet = tbb::concurrent_unordered_set<T>;
+
+            template <typename K, typename V>
+            using ConcurrentMap = tbb::concurrent_unordered_map<K, V>;
+
+            template <typename T>
+            using ConcurrentQueue = tbb::concurrent_queue<T>;
+
+            template <typename T>
+            using ConcurrentPriorityQueue = tbb::concurrent_priority_queue<T>;
+#else
             template <typename T>
             class ConcurrentSet
             {
+                typedef typename std::unordered_set<T>::iterator iterator;
+
             public:
                 ConcurrentSet() { m_lock.reset(new std::shared_timed_mutex); }
 
@@ -42,10 +66,10 @@ namespace SPTAG
                     return m_data.count(key);
                 }
 
-                void insert(const T& key)
+                std::pair<iterator, bool> insert(const T& key)
                 {
                     std::unique_lock<std::shared_timed_mutex> lock(*m_lock);
-                    m_data.insert(key);
+                    return m_data.insert(key);
                 }
 
             private:
@@ -57,6 +81,7 @@ namespace SPTAG
             class ConcurrentMap
             {
                 typedef typename std::unordered_map<K, V>::iterator iterator;
+
             public:
                 ConcurrentMap(int capacity = 8) { m_lock.reset(new std::shared_timed_mutex); m_data.reserve(capacity); }
 
@@ -78,6 +103,19 @@ namespace SPTAG
                 {
                     std::unique_lock<std::shared_timed_mutex> lock(*m_lock);
                     return m_data[k];
+                }
+
+                size_t unsafe_erase(const K& k)
+                {
+                    std::unique_lock<std::shared_timed_mutex> lock(*m_lock);
+                    return m_data.erase(k);
+                }
+
+                template<class P>
+                std::pair<iterator, bool> insert(P&& v)
+                {
+                    std::unique_lock<std::shared_timed_mutex> lock(*m_lock);
+                    return m_data.insert(v);
                 }
 
             private:
@@ -103,8 +141,9 @@ namespace SPTAG
                 bool try_pop(T& j)
                 {
                     std::lock_guard<std::mutex> lock(m_lock);
-                    if (m_queue.empty()) return false;
-
+                    if (m_queue.empty()) {
+                        return false;
+                    }
                     j = m_queue.front();
                     m_queue.pop();
                     return true;
@@ -114,6 +153,39 @@ namespace SPTAG
                 std::mutex m_lock;
                 std::queue<T> m_queue;
             };
+
+            template <typename T>
+            class ConcurrentPriorityQueue 
+            {
+            public:
+                ConcurrentPriorityQueue() {}
+                ~ConcurrentPriorityQueue() {}
+
+            size_type size() const {
+                std::lock_guard<std::mutex> lock(m_lock);
+                return m_queue.size();
+            }
+
+            void push(const T& value) {
+                std::lock_guard<std::mutex> lock(m_lock);
+                m_queue.push(value);
+            }
+
+            bool try_pop(T& value) {
+                std::lock_guard<std::mutex> lock(m_lock);
+                if (m_queue.empty()) {
+                    return false;
+                }
+                value = m_queue.top();
+                m_queue.pop();
+                return true; 
+            }
+
+            private:
+                std::mutex m_lock;
+                std::priority_queue<T> m_queue;
+            };
+#endif // TBB
 #else
             template <typename T>
             using ConcurrentSet = Concurrency::concurrent_unordered_set<T>;
@@ -123,6 +195,9 @@ namespace SPTAG
             
             template <typename T>
             using ConcurrentQueue = Concurrency::concurrent_queue<T>;
+
+            template <typename T>
+            using ConcurrentPriorityQueue = Concurrency::concurrent_priority_queue<T>;
 #endif
         }
     }
