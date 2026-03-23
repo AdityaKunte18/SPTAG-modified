@@ -10,7 +10,7 @@ using namespace SPTAG::Service;
 
 SearchExecutionContext::SearchExecutionContext(const std::shared_ptr<const ServiceSettings> &p_serviceSettings)
     : c_serviceSettings(p_serviceSettings), m_vectorDimension(0), m_inputValueType(VectorValueType::Undefined),
-      m_extractMetadata(false), m_resultNum(p_serviceSettings->m_defaultMaxResultNumber)
+      m_extractMetadata(true), m_resultNum(p_serviceSettings->m_defaultMaxResultNumber)
 {
 }
 

@@ -11,6 +11,9 @@
 #include "inc/Core/KDT/Index.h"
 #include "inc/Core/SPANN/Index.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <filesystem>
 
 typedef typename SPTAG::Helper::Concurrent::ConcurrentMap<std::string, SPTAG::SizeType> MetadataMap;
@@ -20,6 +23,29 @@ using namespace SPTAG;
 
 Helper::LoggerHolder &SPTAG::GetLoggerHolder()
 {
+    auto parseLogLevel = [](const char* raw, Helper::LogLevel fallback) -> Helper::LogLevel {
+        if (raw == nullptr || raw[0] == '\0') return fallback;
+
+        std::string value(raw);
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        if (value == "debug") return Helper::LogLevel::LL_Debug;
+        if (value == "info") return Helper::LogLevel::LL_Info;
+        if (value == "status") return Helper::LogLevel::LL_Status;
+        if (value == "warning" || value == "warn") return Helper::LogLevel::LL_Warning;
+        if (value == "error") return Helper::LogLevel::LL_Error;
+        if (value == "assert") return Helper::LogLevel::LL_Assert;
+
+        char* end = nullptr;
+        long parsed = std::strtol(raw, &end, 10);
+        if (end != raw && *end == '\0' && parsed >= 0 && parsed < static_cast<long>(Helper::LogLevel::LL_Count))
+        {
+            return static_cast<Helper::LogLevel>(parsed);
+        }
+        return fallback;
+    };
+
 #ifdef DEBUG
     auto logLevel = Helper::LogLevel::LL_Debug;
 #else
@@ -35,7 +61,20 @@ Helper::LoggerHolder &SPTAG::GetLoggerHolder()
         }
     }
 #endif //  _WINDOWS_
-    static Helper::LoggerHolder s_pLoggerHolder(std::make_shared<Helper::SimpleLogger>(logLevel));
+    logLevel = parseLogLevel(std::getenv("SPTAG_LOG_LEVEL"), logLevel);
+
+    const char* logFile = std::getenv("SPTAG_LOG_FILE");
+    std::shared_ptr<Helper::Logger> logger;
+    if (logFile != nullptr && logFile[0] != '\0')
+    {
+        logger = std::make_shared<Helper::FileLogger>(logLevel, logFile);
+    }
+    else
+    {
+        logger = std::make_shared<Helper::SimpleLogger>(logLevel);
+    }
+
+    static Helper::LoggerHolder s_pLoggerHolder(logger);
     return s_pLoggerHolder;
 }
 

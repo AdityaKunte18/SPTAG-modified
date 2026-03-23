@@ -26,6 +26,8 @@ AggregatorContext::AggregatorContext(const std::string &p_filePath) : m_initiali
 
     m_settings->m_listenAddr = iniReader.GetParameter("Service", "ListenAddr", std::string("0.0.0.0"));
     m_settings->m_listenPort = iniReader.GetParameter("Service", "ListenPort", std::string("8100"));
+    m_settings->m_searchTimeout =
+        iniReader.GetParameter("Service", "SearchTimeout", static_cast<std::uint32_t>(5000));
     m_settings->m_threadNum = iniReader.GetParameter("Service", "ThreadNumber", static_cast<std::uint32_t>(8));
     m_settings->m_socketThreadNum =
         iniReader.GetParameter("Service", "SocketThreadNumber", static_cast<std::uint32_t>(8));

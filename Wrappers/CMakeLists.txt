@@ -6,6 +6,8 @@ find_package(Python3 COMPONENTS Development)
 
 find_package(CUDA)
 
+find_package(Threads REQUIRED)
+
 if ((NOT GPU) OR (NOT Python3_FOUND))
     set (CUDA_FOUND false)
 endif()
@@ -66,6 +68,22 @@ if (Python_FOUND)
     set_target_properties(_SPTAGClient PROPERTIES PREFIX "" SUFFIX ${PY_SUFFIX})
     target_link_libraries(_SPTAGClient SPTAGLib ${Python_LIBRARIES} ${Boost_LIBRARIES})
     add_custom_command(TARGET _SPTAGClient POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy ${PROJECT_SOURCE_DIR}/Wrappers/inc/SPTAGClient.py ${EXECUTABLE_OUTPUT_PATH})
+    
+     # C++ SIFT1M evaluation client using AnnClient (no Python dependency at runtime)
+    # add_executable(sift_eval_client
+    #     ${PROJECT_SOURCE_DIR}/Wrappers/src/SiftEvalClient.cpp
+    # )
+
+    # target_include_directories(sift_eval_client PRIVATE
+    #     ${PROJECT_SOURCE_DIR}/Wrappers
+    #     ${PROJECT_SOURCE_DIR}/AnnService
+    # )
+
+    # # Link against the same client library used by the Python wrapper
+    # target_link_libraries(sift_eval_client
+    #     _SPTAGClient
+    #     Threads::Threads
+    # )
 
     install(TARGETS _SPTAG _SPTAGClient
     RUNTIME DESTINATION bin
@@ -75,6 +93,43 @@ if (Python_FOUND)
 else()
     message (STATUS "Could not find Python.")
 endif()
+
+# --- Pure C++ SIFT1M evaluation client (no Python dependency) --- #
+# --- Pure C++ SIFT1M evaluation client (no Python dependency) --- #
+file(GLOB CLIENT_CPP_HDR_FILES
+    ${PROJECT_SOURCE_DIR}/Wrappers/inc/ClientInterface.h
+    ${PROJECT_SOURCE_DIR}/AnnService/inc/Socket/*.h
+    ${PROJECT_SOURCE_DIR}/AnnService/inc/Client/*.h
+)
+
+file(GLOB CLIENT_CPP_SRC_FILES
+    ${PROJECT_SOURCE_DIR}/Wrappers/src/ClientInterface.cpp
+    ${PROJECT_SOURCE_DIR}/AnnService/src/Socket/*.cpp
+    ${PROJECT_SOURCE_DIR}/AnnService/src/Client/*.cpp
+)
+
+# Exclude the original AnnService client main.cpp to avoid multiple main() definitions
+list(FILTER CLIENT_CPP_SRC_FILES EXCLUDE REGEX ".*/AnnService/src/Client/main\\.cpp$")
+
+add_executable(sift_eval_client
+    ${PROJECT_SOURCE_DIR}/Wrappers/src/SiftEvalClient.cpp
+    ${CLIENT_CPP_SRC_FILES}
+    ${CLIENT_CPP_HDR_FILES}
+)
+
+target_include_directories(sift_eval_client PRIVATE
+    ${PROJECT_SOURCE_DIR}/Wrappers
+    ${PROJECT_SOURCE_DIR}/AnnService
+)
+
+target_link_libraries(sift_eval_client
+    SPTAGLib
+    ${Boost_LIBRARIES}
+    Threads::Threads
+)
+#####
+
+
 
 find_package(JNI)
 if (JNI_FOUND)
@@ -92,7 +147,6 @@ if (JNI_FOUND)
 
     execute_process(COMMAND swig -java -c++ -I${PROJECT_SOURCE_DIR}/Wrappers/inc -o ${PROJECT_SOURCE_DIR}/Wrappers/inc/CoreInterface_jwrap.cpp ${PROJECT_SOURCE_DIR}/Wrappers/inc/JavaCore.i)
     execute_process(COMMAND swig -java -c++ -I${PROJECT_SOURCE_DIR}/Wrappers/inc -o ${PROJECT_SOURCE_DIR}/Wrappers/inc/ClientInterface_jwrap.cpp ${PROJECT_SOURCE_DIR}/Wrappers/inc/JavaClient.i)
-    execute_process(COMMAND swig -java -package site.ycsb.fileiointerface -c++ -I${PROJECT_SOURCE_DIR}/Wrappers/inc -o ${PROJECT_SOURCE_DIR}/Wrappers/inc/FileIOInterface_jwrap.cpp ${PROJECT_SOURCE_DIR}/Wrappers/inc/JavaFileIO.i)
 
     include_directories(${JNI_INCLUDE_DIRS} ${PROJECT_SOURCE_DIR}/AnnService ${PROJECT_SOURCE_DIR}/Wrappers)
 
@@ -108,19 +162,13 @@ if (JNI_FOUND)
     set_target_properties(JAVASPTAGClient PROPERTIES SUFFIX ${JAVA_SUFFIX})
     target_link_libraries(JAVASPTAGClient SPTAGLib ${JNI_LIBRARIES} ${Boost_LIBRARIES})
 
-    file(GLOB FILEIO_HDR_FILES ${PROJECT_SOURCE_DIR}/Wrappers/inc/FileIOInterface.h)
-    file(GLOB FILEIO_SRC_FILES ${PROJECT_SOURCE_DIR}/Wrappers/inc/FileIOInterface_jwrap.cpp)
-    add_library (JAVASPTAGFileIO SHARED ${FILEIO_SRC_FILES} ${FILEIO_HDR_FILES})
-    set_target_properties(JAVASPTAGFileIO PROPERTIES SUFFIX ${JAVA_SUFFIX})
-    target_link_libraries(JAVASPTAGFileIO SPTAGLib ${JNI_LIBRARIES})
-
     file(GLOB JAVA_FILES ${PROJECT_SOURCE_DIR}/Wrappers/inc/*.java)
     foreach(JAVA_FILE ${JAVA_FILES})
         message (STATUS "Add copy post-command for file " ${JAVA_FILE})
         add_custom_command(TARGET JAVASPTAGClient POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy ${JAVA_FILE} ${EXECUTABLE_OUTPUT_PATH})
     endforeach(JAVA_FILE)
 
-    install(TARGETS JAVASPTAG JAVASPTAGClient JAVASPTAGFileIO
+    install(TARGETS JAVASPTAG JAVASPTAGClient
     RUNTIME DESTINATION bin
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib)
