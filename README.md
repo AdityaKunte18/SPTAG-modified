@@ -50,8 +50,8 @@ The searches in the trees and the graph are iteratively conducted.
 ### **Fast clone**
 
 ```
-set GIT_LFS_SKIP_SMUDGE=1
-git clone --recurse-submodules https://github.com/microsoft/SPTAG
+export GIT_LFS_SKIP_SMUDGE=1
+git clone --recurse-submodules https://github.com/AdityaKunte18/SPTAG-modified.git
 
 OR
 
