@@ -89,7 +89,9 @@ sudo make install
 > Build SPTAG
 ```bash
 mkdir build
-cd build && cmake -DSPDK=OFF -DROCKSDB=OFF .. && make
+cd build 
+cmake -DCMAKE_BUILD_TYPE=Release -DSPDK=OFF -DROCKSDB=OFF ..
+make -j"$(nproc)"
 ```
 It will generate a Release folder in the code directory which contains all the build targets.
 
