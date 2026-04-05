@@ -1,40 +1,24 @@
-# =========================
-# master.py (HTTP server)
-# =========================
 #!/usr/bin/env python3
-"""Distributed SPTAG shard build master (HTTP server).
-
-Receives batches from a client, tracks workers that register dynamically,
-splits each incoming client batch across the workers currently initialized
-for the job, and forwards sub-batches to workers.
-
-Endpoints:
-- POST /register_worker — register a worker with the master
-- POST /init            — initialize a job
-- POST /add_batch       — receive a batch from client, split & forward to worker(s)
-- POST /finalize        — finalize a job (drain workers, save indexes)
-- GET  /status          — query job status
-- POST /shutdown        — shut down the master server
-"""
+"""Distributed SPTAG shard build master with centroid routing and rebalance."""
 from __future__ import annotations
+
 import argparse
 import concurrent.futures
 import json
+import math
 import struct
 import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import List, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
-
-# ── HTTP helpers (for forwarding to workers) ────────────────────────────────
 
 def _read_json_file(path: Path):
     with open(path, "r", encoding="utf-8") as f:
@@ -78,6 +62,12 @@ def _http_binary_post(url: str, payload: bytes, timeout_s: int):
             except json.JSONDecodeError:
                 pass
         raise
+
+
+def _http_json_get(url: str, timeout_s: int):
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout_s) as r:
+        return _read_json_http_response(r)
 
 
 def _post_with_retry(url: str, fn, retries: int, what: str):
@@ -125,8 +115,6 @@ def _send_batch_with_backpressure(
         return resp
 
 
-# ── HTTP response / request helpers (for serving clients) ───────────────────
-
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
     body = json.dumps(payload).encode("utf-8")
     try:
@@ -145,23 +133,134 @@ def _read_json(handler: BaseHTTPRequestHandler) -> dict:
     return json.loads(raw.decode("utf-8"))
 
 
-# ── Shard computation ───────────────────────────────────────────────────────
-
-def shard_bounds(n: int, num_shards: int, shard_id: int) -> Tuple[int, int]:
-    base = n // num_shards
-    rem = n % num_shards
-    start = shard_id * base + (shard_id if shard_id < rem else rem)
-    size = base + (1 if shard_id < rem else 0)
-    return start, start + size
+def _normalize_rows(vectors: np.ndarray) -> np.ndarray:
+    if vectors.size == 0:
+        return vectors
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-12)
+    return vectors / norms
 
 
-# ── Data models ─────────────────────────────────────────────────────────────
+def _distance_matrix(vectors: np.ndarray, centroids: np.ndarray, metric: str) -> np.ndarray:
+    if vectors.size == 0 or centroids.size == 0:
+        return np.zeros((vectors.shape[0], centroids.shape[0]), dtype=np.float32)
+    metric_name = metric.upper()
+    if metric_name in {"COSINE", "COSINESIMILARITY", "COSINE_SIMILARITY"}:
+        lhs = _normalize_rows(vectors.astype(np.float32, copy=False))
+        rhs = _normalize_rows(centroids.astype(np.float32, copy=False))
+        return 1.0 - (lhs @ rhs.T)
+    diff = vectors[:, None, :] - centroids[None, :, :]
+    return np.sum(diff * diff, axis=2)
+
+
+def _seed_for_job(job_id: str, suffix: str = "") -> int:
+    return zlib.crc32(f"{job_id}:{suffix}".encode("utf-8")) & 0xFFFFFFFF
+
+
+def _kmeans_plus_plus(vectors: np.ndarray, k: int, metric: str, seed: int) -> np.ndarray:
+    n = vectors.shape[0]
+    if n == 0:
+        return np.zeros((k, vectors.shape[1]), dtype=np.float32)
+    rng = np.random.default_rng(seed)
+    centroids = np.empty((k, vectors.shape[1]), dtype=np.float32)
+    first = int(rng.integers(0, n))
+    centroids[0] = vectors[first]
+    if k == 1:
+        return centroids
+    closest = _distance_matrix(vectors, centroids[:1], metric).reshape(-1)
+    for idx in range(1, k):
+        if np.allclose(closest.sum(), 0.0):
+            pick = int(rng.integers(0, n))
+        else:
+            probs = closest / closest.sum()
+            pick = int(rng.choice(n, p=probs))
+        centroids[idx] = vectors[pick]
+        newest = _distance_matrix(vectors, centroids[idx : idx + 1], metric).reshape(-1)
+        closest = np.minimum(closest, newest)
+    return centroids
+
+
+def _balanced_assign(vectors: np.ndarray, centroids: np.ndarray, metric: str) -> np.ndarray:
+    n, k = vectors.shape[0], centroids.shape[0]
+    if n == 0:
+        return np.empty((0,), dtype=np.int32)
+    capacity = max(1, int(math.ceil(float(n) / float(k))))
+    dists = _distance_matrix(vectors, centroids, metric)
+    order = np.argsort(dists.reshape(-1), kind="stable")
+    assignments = np.full(n, -1, dtype=np.int32)
+    counts = np.zeros(k, dtype=np.int32)
+
+    for flat_idx in order.tolist():
+        point_idx = flat_idx // k
+        centroid_idx = flat_idx % k
+        if assignments[point_idx] != -1:
+            continue
+        if counts[centroid_idx] >= capacity:
+            continue
+        assignments[point_idx] = centroid_idx
+        counts[centroid_idx] += 1
+        if np.all(assignments != -1):
+            return assignments
+
+    for point_idx in np.flatnonzero(assignments == -1).tolist():
+        centroid_order = np.argsort(dists[point_idx], kind="stable")
+        assigned = False
+        for centroid_idx in centroid_order.tolist():
+            if counts[centroid_idx] < capacity:
+                assignments[point_idx] = centroid_idx
+                counts[centroid_idx] += 1
+                assigned = True
+                break
+        if not assigned:
+            centroid_idx = int(np.argmin(counts))
+            assignments[point_idx] = centroid_idx
+            counts[centroid_idx] += 1
+    return assignments
+
+
+def _balanced_kmeans(vectors: np.ndarray, k: int, metric: str, seed: int, max_iter: int = 50) -> tuple[np.ndarray, np.ndarray]:
+    dim = vectors.shape[1] if vectors.ndim == 2 else 0
+    if k <= 0:
+        raise ValueError("k must be positive")
+    if vectors.size == 0:
+        return np.zeros((k, dim), dtype=np.float32), np.empty((0,), dtype=np.int32)
+
+    if vectors.shape[0] < k:
+        repeats = int(math.ceil(float(k) / float(vectors.shape[0])))
+        padded = np.vstack([vectors] * repeats)[:k]
+        return padded.astype(np.float32, copy=False), np.arange(vectors.shape[0], dtype=np.int32) % k
+
+    centroids = _kmeans_plus_plus(vectors, k, metric, seed)
+    assignments = np.full(vectors.shape[0], -1, dtype=np.int32)
+
+    for _ in range(max_iter):
+        new_assignments = _balanced_assign(vectors, centroids, metric)
+        new_centroids = centroids.copy()
+        for centroid_idx in range(k):
+            members = vectors[new_assignments == centroid_idx]
+            if members.size == 0:
+                continue
+            center = members.mean(axis=0, dtype=np.float32)
+            if metric.upper() in {"COSINE", "COSINESIMILARITY", "COSINE_SIMILARITY"}:
+                norm = np.linalg.norm(center)
+                if norm > 1e-12:
+                    center = center / norm
+            new_centroids[centroid_idx] = center.astype(np.float32, copy=False)
+        if np.array_equal(assignments, new_assignments):
+            assignments = new_assignments
+            centroids = new_centroids
+            break
+        assignments = new_assignments
+        centroids = new_centroids
+    return centroids.astype(np.float32, copy=False), assignments
+
 
 @dataclass
 class Worker:
     worker_id: int
     host: str
     port: int
+    registered: bool = False
 
     @property
     def base_url(self) -> str:
@@ -181,6 +280,13 @@ class ShardInfo:
 
 
 @dataclass
+class BufferedBatch:
+    global_ids: np.ndarray
+    vectors: np.ndarray
+    normalized: bool
+
+
+@dataclass
 class MasterJobState:
     job_id: str
     dim: int
@@ -189,48 +295,168 @@ class MasterJobState:
     output_dir: str
     threads: int
     with_meta_index: bool
-    shards: List[ShardInfo] = field(default_factory=list)
+    shards: list[ShardInfo] = field(default_factory=list)
     finalized: bool = False
     error: str | None = None
     init_time: float = 0.0
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
+
+    routing_mode: str = "bootstrap"
+    routing_epoch: int = 0
+    worker_centroids: dict[int, np.ndarray] = field(default_factory=dict, repr=False)
+    worker_counts: dict[int, int] = field(default_factory=dict)
+    pending_new_workers: set[int] = field(default_factory=set)
+    bootstrap_batches: list[BufferedBatch] = field(default_factory=list, repr=False)
+    bootstrap_vector_count: int = 0
+    reservoir_vectors: list[np.ndarray] = field(default_factory=list, repr=False)
+    reservoir_seen: int = 0
+    rebalance_thread: threading.Thread | None = field(default=None, repr=False, compare=False)
+    centers_file: str | None = None
+    activation_waiting_for_worker: bool = False
 
 
 STATE: dict[str, MasterJobState] = {}
 STATE_LOCK = threading.Lock()
 
 
-def _resolve_workers(args) -> List[Worker]:
-    if args.workers_file:
-        arr = _read_json_file(Path(args.workers_file))
-        workers = [Worker(i, str(x["host"]), int(x["port"])) for i, x in enumerate(arr)]
+def _worker_endpoint_key(host: str, port: int) -> str:
+    return f"{host}:{port}"
+
+
+def _parse_worker_spec(raw, default_id: int, field_name: str) -> Worker:
+    if isinstance(raw, dict):
+        try:
+            host = str(raw["host"]).strip()
+            port = int(raw["port"])
+        except Exception as ex:
+            raise ValueError(f"{field_name} contains invalid worker entry {raw!r}") from ex
+        worker_id = int(raw.get("worker_id", default_id))
+        return Worker(worker_id, host, port)
+
+    token = str(raw).strip()
+    if not token:
+        raise ValueError(f"{field_name} contains an empty worker entry")
+    if "@" in token:
+        worker_id_raw, endpoint = token.split("@", 1)
+        worker_id = int(worker_id_raw)
     else:
-        if not args.workers:
-            return []
-        workers = []
-        for i, item in enumerate(args.workers):
-            host, port = item.rsplit(":", 1)
-            workers.append(Worker(i, host, int(port)))
+        worker_id = default_id
+        endpoint = token
+    host, port = endpoint.rsplit(":", 1)
+    return Worker(worker_id, host, int(port))
+
+
+def _resolve_workers(worker_file: str | None, inline_workers, field_name: str) -> list[Worker]:
+    if worker_file:
+        arr = _read_json_file(Path(worker_file))
+        if not isinstance(arr, list):
+            raise ValueError(f"{field_name} must point to a JSON array of workers")
+        source = arr
+    else:
+        source = list(inline_workers or [])
+
+    workers: list[Worker] = []
+    seen_ids: set[int] = set()
+    seen_endpoints: set[str] = set()
+    for idx, raw in enumerate(source):
+        worker = _parse_worker_spec(raw, idx, field_name)
+        endpoint_key = _worker_endpoint_key(worker.host, worker.port)
+        if worker.worker_id in seen_ids:
+            raise ValueError(f"{field_name} repeats worker_id={worker.worker_id}")
+        if endpoint_key in seen_endpoints:
+            raise ValueError(f"{field_name} repeats worker endpoint {endpoint_key}")
+        seen_ids.add(worker.worker_id)
+        seen_endpoints.add(endpoint_key)
+        workers.append(worker)
+    workers.sort(key=lambda item: item.worker_id)
     return workers
 
 
-def _snapshot_registered_workers(server) -> List[Worker]:
+def _snapshot_workers(server) -> list[Worker]:
     with server.worker_lock:
         workers = list(server.workers.values())
     workers.sort(key=lambda w: w.worker_id)
     return workers
 
 
-def _register_worker(server, host: str, port: int) -> tuple[Worker, bool]:
-    worker_key = f"{host}:{port}"
+def _snapshot_registered_workers(server) -> list[Worker]:
     with server.worker_lock:
-        worker = server.workers.get(worker_key)
-        if worker is not None:
-            return worker, False
-        worker = Worker(server.next_worker_id, host, port)
-        server.workers[worker.key] = worker
-        server.next_worker_id += 1
-        return worker, True
+        workers = [worker for worker in server.workers.values() if worker.registered]
+    workers.sort(key=lambda w: w.worker_id)
+    return workers
+
+
+def _add_configured_worker(server, worker: Worker, *, registered: bool) -> Worker:
+    endpoint_key = _worker_endpoint_key(worker.host, worker.port)
+    with server.worker_lock:
+        existing = server.workers.get(worker.worker_id)
+        if existing is not None:
+            if (existing.host, existing.port) != (worker.host, worker.port):
+                raise ValueError(
+                    f"worker_id={worker.worker_id} is already assigned to {existing.host}:{existing.port}"
+                )
+            existing.registered = existing.registered or registered
+            server.worker_key_to_id[endpoint_key] = worker.worker_id
+            return existing
+
+        other_id = server.worker_key_to_id.get(endpoint_key)
+        if other_id is not None and other_id != worker.worker_id:
+            raise ValueError(f"worker endpoint {endpoint_key} is already assigned to worker_id={other_id}")
+
+        worker.registered = registered
+        server.workers[worker.worker_id] = worker
+        server.worker_key_to_id[endpoint_key] = worker.worker_id
+        server.next_worker_id = max(server.next_worker_id, worker.worker_id + 1)
+        return worker
+
+
+def _register_worker(server, host: str, port: int, cluster_worker_id: int | None = None) -> tuple[Worker, bool]:
+    endpoint_key = _worker_endpoint_key(host, port)
+    with server.worker_lock:
+        worker: Worker | None = None
+        if cluster_worker_id is not None:
+            worker = server.workers.get(cluster_worker_id)
+            if worker is not None and (worker.host, worker.port) != (host, port):
+                raise ValueError(
+                    f"cluster_worker_id={cluster_worker_id} expected {worker.host}:{worker.port}, got {host}:{port}"
+                )
+        else:
+            worker_id = server.worker_key_to_id.get(endpoint_key)
+            if worker_id is not None:
+                worker = server.workers.get(worker_id)
+
+        if worker is None:
+            worker_id = int(cluster_worker_id) if cluster_worker_id is not None else server.next_worker_id
+            while worker_id in server.workers:
+                worker_id += 1
+            worker = Worker(worker_id, host, port)
+            server.workers[worker.worker_id] = worker
+            server.next_worker_id = max(server.next_worker_id, worker.worker_id + 1)
+
+        server.worker_key_to_id[endpoint_key] = worker.worker_id
+        already_registered = worker.registered
+        worker.host = host
+        worker.port = port
+        worker.registered = True
+        return worker, already_registered
+
+
+def _reservoir_matrix(job: MasterJobState) -> np.ndarray:
+    if not job.reservoir_vectors:
+        return np.zeros((0, job.dim), dtype=np.float32)
+    return np.vstack(job.reservoir_vectors).astype(np.float32, copy=False)
+
+
+def _update_reservoir(job: MasterJobState, vectors: np.ndarray, reservoir_size: int) -> None:
+    for row in vectors:
+        row_copy = np.ascontiguousarray(row, dtype=np.float32)
+        if len(job.reservoir_vectors) < reservoir_size:
+            job.reservoir_vectors.append(row_copy)
+        else:
+            replace_idx = np.random.randint(0, job.reservoir_seen + 1)
+            if replace_idx < reservoir_size:
+                job.reservoir_vectors[replace_idx] = row_copy
+        job.reservoir_seen += 1
 
 
 def _init_worker_for_job(
@@ -268,27 +494,497 @@ def _init_worker_for_job(
     return shard
 
 
-def _ensure_job_workers(server, job: MasterJobState) -> List[ShardInfo]:
+def _ensure_initial_job_workers(server, job: MasterJobState) -> list[ShardInfo]:
     request_timeout = server.request_timeout
     retries = server.retries
-    registered_workers = _snapshot_registered_workers(server)
     initialized_worker_ids = {shard.worker.worker_id for shard in job.shards}
+    newly_initialized: list[ShardInfo] = []
 
-    for worker in registered_workers:
-        if worker.worker_id in initialized_worker_ids:
+    worker_ids = list(getattr(server, "initial_worker_ids", []))
+    if not worker_ids:
+        threshold_ids = set(getattr(server, "threshold_join_worker_ids", []))
+        worker_ids = [
+            worker.worker_id
+            for worker in _snapshot_workers(server)
+            if worker.worker_id not in threshold_ids
+        ]
+
+    with server.worker_lock:
+        workers_by_id = {worker.worker_id: worker for worker in server.workers.values()}
+
+    for worker_id in worker_ids:
+        if worker_id in initialized_worker_ids:
             continue
-        _init_worker_for_job(
+        worker = workers_by_id.get(worker_id)
+        if worker is None:
+            raise RuntimeError(f"initial worker_id={worker_id} is not configured")
+        shard = _init_worker_for_job(
             job=job,
             worker=worker,
             request_timeout=request_timeout,
             retries=retries,
         )
+        newly_initialized.append(shard)
         initialized_worker_ids.add(worker.worker_id)
 
+    _refresh_activation_wait_state(server, job)
+    return newly_initialized
+
+
+def _maybe_activate_threshold_worker(server, job: MasterJobState) -> bool:
+    _refresh_activation_wait_state(server, job)
+    if int(getattr(server, "activation_threshold_vectors", 0)) <= 0:
+        return False
+    if job.routing_mode != "centroid":
+        return False
+    if job.pending_new_workers:
+        return False
+    if job.rebalance_thread is not None and job.rebalance_thread.is_alive():
+        return False
+    if not _threshold_breached_worker_ids(server, job):
+        job.activation_waiting_for_worker = False
+        return False
+
+    next_candidate = _next_threshold_candidate_id(server, job)
+    if next_candidate is None:
+        job.activation_waiting_for_worker = False
+        return False
+
+    idle_ids = _idle_registered_threshold_worker_ids(server, job)
+    if next_candidate not in idle_ids:
+        job.activation_waiting_for_worker = True
+        return False
+
+    with server.worker_lock:
+        worker = server.workers.get(next_candidate)
+    if worker is None:
+        raise RuntimeError(f"threshold worker_id={next_candidate} is not configured")
+
+    _init_worker_for_job(
+        job=job,
+        worker=worker,
+        request_timeout=server.request_timeout,
+        retries=server.retries,
+    )
+    job.pending_new_workers.add(worker.worker_id)
+    job.activation_waiting_for_worker = False
+
+    if not _maybe_start_rebalance(server, job):
+        raise RuntimeError(f"failed to start rebalance after activating worker_id={worker.worker_id}")
+    return True
+
+
+def _active_shards(job: MasterJobState) -> list[ShardInfo]:
+    if job.worker_centroids:
+        active_ids = set(job.worker_centroids.keys())
+        return [shard for shard in job.shards if shard.worker.worker_id in active_ids]
     return list(job.shards)
 
 
-# ── Master HTTP handler ─────────────────────────────────────────────────────
+def _update_worker_stats(job: MasterJobState, worker_id: int, vectors: np.ndarray) -> None:
+    if vectors.size == 0:
+        return
+    count = int(job.worker_counts.get(worker_id, 0))
+    batch_sum = vectors.sum(axis=0, dtype=np.float64)
+    batch_count = int(vectors.shape[0])
+    if count <= 0 or worker_id not in job.worker_centroids:
+        job.worker_centroids[worker_id] = (batch_sum / float(batch_count)).astype(np.float32)
+        job.worker_counts[worker_id] = batch_count
+        return
+    old_center = job.worker_centroids[worker_id].astype(np.float64)
+    new_count = count + batch_count
+    new_center = ((old_center * count) + batch_sum) / float(new_count)
+    job.worker_centroids[worker_id] = new_center.astype(np.float32)
+    job.worker_counts[worker_id] = new_count
+
+
+def _initialized_worker_ids(job: MasterJobState) -> set[int]:
+    return {shard.worker.worker_id for shard in job.shards}
+
+
+def _active_worker_ids(job: MasterJobState) -> set[int]:
+    if job.worker_centroids:
+        return set(job.worker_centroids.keys())
+    return _initialized_worker_ids(job)
+
+
+def _threshold_breached_worker_ids(server, job: MasterJobState) -> list[int]:
+    threshold = int(getattr(server, "activation_threshold_vectors", 0))
+    if threshold <= 0:
+        return []
+    breached = [
+        worker_id
+        for worker_id in sorted(_active_worker_ids(job))
+        if int(job.worker_counts.get(worker_id, 0)) >= threshold
+    ]
+    return breached
+
+
+def _next_threshold_candidate_id(server, job: MasterJobState) -> int | None:
+    initialized_ids = _initialized_worker_ids(job)
+    for worker_id in getattr(server, "threshold_join_worker_ids", []):
+        if worker_id not in initialized_ids:
+            return worker_id
+    return None
+
+
+def _idle_registered_threshold_worker_ids(server, job: MasterJobState) -> list[int]:
+    initialized_ids = _initialized_worker_ids(job)
+    idle_ids: list[int] = []
+    with server.worker_lock:
+        for worker_id in getattr(server, "threshold_join_worker_ids", []):
+            if worker_id in initialized_ids:
+                continue
+            worker = server.workers.get(worker_id)
+            if worker is not None and worker.registered:
+                idle_ids.append(worker_id)
+    return idle_ids
+
+
+def _refresh_activation_wait_state(server, job: MasterJobState) -> None:
+    next_candidate = _next_threshold_candidate_id(server, job)
+    job.activation_waiting_for_worker = bool(
+        _threshold_breached_worker_ids(server, job)
+        and next_candidate is not None
+        and not _idle_registered_threshold_worker_ids(server, job)
+    )
+
+
+def _route_vectors_to_workers(job: MasterJobState, vectors: np.ndarray, metric: str) -> np.ndarray:
+    active = _active_shards(job)
+    if len(active) <= 1:
+        return np.zeros(vectors.shape[0], dtype=np.int32)
+    ordered_centroids = np.vstack([job.worker_centroids[shard.worker.worker_id] for shard in active]).astype(np.float32)
+    return np.argmin(_distance_matrix(vectors, ordered_centroids, metric), axis=1).astype(np.int32)
+
+
+def _forward_sub_batch(
+    *,
+    server,
+    job: MasterJobState,
+    shard: ShardInfo,
+    vectors: np.ndarray,
+    global_ids: np.ndarray,
+    normalized: bool,
+) -> None:
+    vectors = np.ascontiguousarray(vectors, dtype=np.float32)
+    global_ids = np.ascontiguousarray(global_ids, dtype=np.int64)
+    batch_id = shard.next_batch_id
+    worker_meta = {
+        "job_id": job.job_id,
+        "shard_id": shard.shard_id,
+        "batch_id": batch_id,
+        "num": int(vectors.shape[0]),
+        "dim": job.dim,
+        "with_meta_index": job.with_meta_index,
+        "normalized": normalized,
+        "ids": global_ids.astype(np.int64).tolist(),
+    }
+    meta_raw = json.dumps(worker_meta).encode("utf-8")
+    payload = struct.pack("<Q", len(meta_raw)) + meta_raw + vectors.tobytes()
+    url = f"{shard.worker.base_url}/add_batch"
+    resp = _send_batch_with_backpressure(
+        url=url,
+        payload=payload,
+        request_timeout=server.request_timeout,
+        retries=server.retries,
+        what=f"add_batch shard {shard.shard_id} batch {batch_id}",
+    )
+    if not resp.get("ok", False):
+        raise RuntimeError(f"worker add_batch failed shard={shard.shard_id} batch={batch_id}: {resp}")
+    shard.next_batch_id += 1
+    shard.vectors_forwarded += int(vectors.shape[0])
+    _update_worker_stats(job, shard.worker.worker_id, vectors)
+    if server.debug:
+        print(
+            f"[debug] forwarded shard={shard.shard_id} batch={batch_id} "
+            f"count={vectors.shape[0]} ids=[{int(global_ids[0])}..{int(global_ids[-1])}]"
+        )
+
+
+def _forward_routed_batch(server, job: MasterJobState, vectors: np.ndarray, global_ids: np.ndarray, normalized: bool) -> int:
+    active = _active_shards(job)
+    if not active:
+        raise RuntimeError("no active shards available")
+    assignments = _route_vectors_to_workers(job, vectors, job.dist)
+    touched = 0
+    for local_idx, shard in enumerate(active):
+        rows = np.flatnonzero(assignments == local_idx)
+        if rows.size == 0:
+            continue
+        sub_vectors = np.ascontiguousarray(vectors[rows], dtype=np.float32)
+        sub_ids = np.ascontiguousarray(global_ids[rows], dtype=np.int64)
+        _forward_sub_batch(server=server, job=job, shard=shard, vectors=sub_vectors, global_ids=sub_ids, normalized=normalized)
+        touched += 1
+    return touched
+
+
+def _bootstrap_if_ready(server, job: MasterJobState, *, force: bool) -> bool:
+    if job.routing_mode != "bootstrap":
+        return False
+    active = list(job.shards)
+    if len(active) <= 1:
+        job.routing_mode = "centroid"
+        return False
+    if not force and job.bootstrap_vector_count < server.bootstrap_sample_size:
+        return False
+    if not job.bootstrap_batches:
+        return False
+
+    sample_vectors = np.vstack([batch.vectors for batch in job.bootstrap_batches]).astype(np.float32, copy=False)
+    centroids, _ = _balanced_kmeans(
+        sample_vectors,
+        k=len(active),
+        metric=job.dist,
+        seed=_seed_for_job(job.job_id, f"bootstrap:{job.routing_epoch}"),
+    )
+    active.sort(key=lambda shard: shard.worker.worker_id)
+    job.worker_centroids = {shard.worker.worker_id: centroids[idx] for idx, shard in enumerate(active)}
+    job.worker_counts = {shard.worker.worker_id: 0 for shard in active}
+
+    buffered = list(job.bootstrap_batches)
+    job.bootstrap_batches.clear()
+    job.bootstrap_vector_count = 0
+    job.routing_mode = "centroid"
+
+    for batch in buffered:
+        _forward_routed_batch(server, job, batch.vectors, batch.global_ids, batch.normalized)
+    _refresh_activation_wait_state(server, job)
+    return True
+
+
+def _wait_for_worker_drain(server, shard: ShardInfo, job_id: str, timeout_s: int) -> None:
+    deadline = time.time() + timeout_s
+    url = f"{shard.worker.base_url}/status?job_id={job_id}&shard_id={shard.shard_id}"
+    while True:
+        resp = _post_with_retry(
+            url,
+            lambda u=url: _http_json_get(u, server.request_timeout),
+            server.retries,
+            f"status shard {shard.shard_id}",
+        )
+        if not resp.get("ok", False):
+            raise RuntimeError(f"status failed for shard {shard.shard_id}: {resp}")
+        if resp.get("error"):
+            raise RuntimeError(f"worker shard {shard.shard_id} error: {resp['error']}")
+        if int(resp.get("queued", 0)) == 0 and int(resp.get("next_expected_batch_id", 0)) == int(resp.get("last_applied_batch_id", -1)) + 1:
+            return
+        if time.time() >= deadline:
+            raise RuntimeError(f"worker shard {shard.shard_id} did not drain before rebalance")
+        time.sleep(0.25)
+
+
+def _prepare_rebalance_plan(job: MasterJobState) -> tuple[list[int], list[int], np.ndarray, dict[int, int]]:
+    pending_ids = sorted(job.pending_new_workers)
+    if not pending_ids:
+        raise RuntimeError("no pending workers to rebalance")
+    existing_ids = sorted(job.worker_centroids.keys())
+    target_worker_ids = existing_ids + pending_ids
+    sample = _reservoir_matrix(job)
+    if sample.shape[0] == 0:
+        raise RuntimeError("cannot rebalance without any reservoir data")
+    centroids, _ = _balanced_kmeans(
+        sample,
+        k=len(target_worker_ids),
+        metric=job.dist,
+        seed=_seed_for_job(job.job_id, f"rebalance:{job.routing_epoch}"),
+    )
+
+    unmatched = set(range(len(target_worker_ids)))
+    centroid_to_worker: dict[int, int] = {}
+    for worker_id in existing_ids:
+        old_center = job.worker_centroids.get(worker_id)
+        if old_center is None:
+            centroid_idx = min(unmatched)
+        else:
+            remaining = sorted(unmatched)
+            dist_rows = _distance_matrix(old_center.reshape(1, -1), centroids[remaining], job.dist).reshape(-1)
+            centroid_idx = remaining[int(np.argmin(dist_rows))]
+        centroid_to_worker[centroid_idx] = worker_id
+        unmatched.remove(centroid_idx)
+
+    for worker_id, centroid_idx in zip(sorted(pending_ids), sorted(unmatched)):
+        centroid_to_worker[centroid_idx] = worker_id
+
+    return existing_ids, target_worker_ids, centroids, centroid_to_worker
+
+
+def _send_rebalance_phase(server, shard: ShardInfo, payload: dict, timeout_s: int) -> dict:
+    url = f"{shard.worker.base_url}/rebalance"
+    resp = _post_with_retry(
+        url,
+        lambda u=url, p=payload: _http_json_post(u, p, timeout_s),
+        server.retries,
+        f"rebalance shard {shard.shard_id} phase {payload['phase']}",
+    )
+    if not resp.get("ok", False):
+        raise RuntimeError(f"rebalance phase {payload['phase']} failed for shard {shard.shard_id}: {resp}")
+    return resp
+
+
+def _run_rebalance(server, job_id: str, routing_epoch: int) -> None:
+    with STATE_LOCK:
+        job = STATE.get(job_id)
+    if job is None:
+        return
+
+    try:
+        with job.lock:
+            existing_ids, target_worker_ids, centroids, centroid_to_worker = _prepare_rebalance_plan(job)
+            target_shards = [shard for shard in job.shards if shard.worker.worker_id in set(target_worker_ids)]
+            target_shards.sort(key=lambda shard: shard.worker.worker_id)
+
+        for shard in target_shards:
+            _wait_for_worker_drain(server, shard, job.job_id, server.rebalance_timeout)
+
+        workers_payload = [
+            {
+                "worker_id": shard.worker.worker_id,
+                "base_url": shard.worker.base_url,
+            }
+            for shard in target_shards
+        ]
+        phase_payloads = []
+        for shard in target_shards:
+            assigned = None
+            for centroid_idx, worker_id in centroid_to_worker.items():
+                if worker_id == shard.worker.worker_id:
+                    assigned = centroid_idx
+                    break
+            if assigned is None:
+                raise RuntimeError(f"missing centroid assignment for worker {shard.worker.worker_id}")
+            phase_payloads.append(
+                (
+                    shard,
+                    {
+                        "job_id": job.job_id,
+                        "shard_id": shard.shard_id,
+                        "routing_epoch": routing_epoch,
+                        "phase": "prepare",
+                        "centroids": centroids.tolist(),
+                        "assigned_centroid_idx": int(assigned),
+                        "centroid_to_worker": {str(k): int(v) for k, v in centroid_to_worker.items()},
+                        "workers": workers_payload,
+                    },
+                )
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(phase_payloads)) as executor:
+            futures = [executor.submit(_send_rebalance_phase, server, shard, payload, server.rebalance_timeout) for shard, payload in phase_payloads]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+
+        migrate_payloads = [
+            (
+                shard,
+                {
+                    "job_id": job.job_id,
+                    "shard_id": shard.shard_id,
+                    "routing_epoch": routing_epoch,
+                    "phase": "migrate",
+                },
+            )
+            for shard in target_shards
+        ]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(migrate_payloads)) as executor:
+            futures = [executor.submit(_send_rebalance_phase, server, shard, payload, server.rebalance_timeout) for shard, payload in migrate_payloads]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+
+        rebuild_payloads = [
+            (
+                shard,
+                {
+                    "job_id": job.job_id,
+                    "shard_id": shard.shard_id,
+                    "routing_epoch": routing_epoch,
+                    "phase": "rebuild",
+                },
+            )
+            for shard in target_shards
+        ]
+        rebuild_results: dict[int, dict] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(rebuild_payloads)) as executor:
+            future_map = {
+                executor.submit(_send_rebalance_phase, server, shard, payload, server.rebalance_timeout): shard.worker.worker_id
+                for shard, payload in rebuild_payloads
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                worker_id = future_map[future]
+                rebuild_results[worker_id] = future.result()
+
+        with job.lock:
+            job.worker_centroids = {
+                worker_id: np.asarray(result["centroid"], dtype=np.float32)
+                for worker_id, result in rebuild_results.items()
+            }
+            job.worker_counts = {
+                worker_id: int(result.get("active_count", 0))
+                for worker_id, result in rebuild_results.items()
+            }
+            for worker_id in target_worker_ids:
+                job.pending_new_workers.discard(worker_id)
+            job.routing_mode = "centroid"
+            job.rebalance_thread = None
+            _refresh_activation_wait_state(server, job)
+            _maybe_activate_threshold_worker(server, job)
+
+    except Exception as ex:
+        with job.lock:
+            job.error = str(ex)
+            job.rebalance_thread = None
+
+
+def _maybe_start_rebalance(server, job: MasterJobState) -> bool:
+    if not job.pending_new_workers:
+        _refresh_activation_wait_state(server, job)
+        return False
+    if job.rebalance_thread is not None and job.rebalance_thread.is_alive():
+        return True
+    if not server.rebalance_enabled:
+        return False
+    if not job.worker_centroids:
+        if len(job.shards) > 1:
+            job.pending_new_workers.clear()
+            job.routing_mode = "bootstrap"
+        else:
+            job.pending_new_workers.clear()
+        _refresh_activation_wait_state(server, job)
+        return False
+    if _reservoir_matrix(job).shape[0] == 0:
+        job.pending_new_workers.clear()
+        job.worker_centroids.clear()
+        job.worker_counts.clear()
+        job.routing_mode = "bootstrap" if len(job.shards) > 1 else "centroid"
+        _refresh_activation_wait_state(server, job)
+        return False
+
+    job.routing_mode = "rebalancing"
+    job.activation_waiting_for_worker = False
+    job.routing_epoch += 1
+    worker_thread = threading.Thread(
+        target=_run_rebalance,
+        args=(server, job.job_id, job.routing_epoch),
+        daemon=True,
+        name=f"rebalance-{job.job_id}-{job.routing_epoch}",
+    )
+    job.rebalance_thread = worker_thread
+    worker_thread.start()
+    return True
+
+
+def _write_centers_file(path: Path, centroids_by_worker: dict[int, np.ndarray], dim: int) -> None:
+    ordered_ids = sorted(centroids_by_worker)
+    matrix = np.vstack([centroids_by_worker[worker_id] for worker_id in ordered_ids]).astype(np.float32, copy=False)
+    if matrix.ndim != 2:
+        raise ValueError(f"invalid centers matrix shape: {matrix.shape}")
+    if matrix.shape[1] != dim:
+        raise ValueError(f"center dim mismatch: matrix has {matrix.shape[1]}, expected {dim}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<ii", int(matrix.shape[0]), int(matrix.shape[1])))
+        f.write(np.ascontiguousarray(matrix, dtype=np.float32).tobytes())
+
 
 class MasterHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -313,13 +1009,14 @@ class MasterHandler(BaseHTTPRequestHandler):
             return self._handle_shutdown()
         _json_response(self, 404, {"ok": False, "error": "not found"})
 
-    # ── /register_worker ────────────────────────────────────────────────
-
     def _handle_register_worker(self):
         req = _read_json(self)
         try:
             host = str(req["host"]).strip()
             port = int(req["port"])
+            cluster_worker_id = req.get("cluster_worker_id")
+            if cluster_worker_id is not None:
+                cluster_worker_id = int(cluster_worker_id)
         except Exception as ex:
             _json_response(self, 400, {"ok": False, "error": f"invalid worker payload: {ex}"})
             return
@@ -328,8 +1025,12 @@ class MasterHandler(BaseHTTPRequestHandler):
             _json_response(self, 400, {"ok": False, "error": "host is required"})
             return
 
-        worker, created = _register_worker(self.server, host, port)
-        if created:
+        try:
+            worker, already_registered = _register_worker(self.server, host, port, cluster_worker_id)
+        except Exception as ex:
+            _json_response(self, 409, {"ok": False, "error": str(ex)})
+            return
+        if not already_registered:
             print(f"[worker] registered worker_id={worker.worker_id} addr={worker.host}:{worker.port}")
 
         _json_response(
@@ -340,12 +1041,10 @@ class MasterHandler(BaseHTTPRequestHandler):
                 "worker_id": worker.worker_id,
                 "host": worker.host,
                 "port": worker.port,
-                "already_registered": not created,
+                "already_registered": already_registered,
                 "registered_workers": len(_snapshot_registered_workers(self.server)),
             },
         )
-
-    # ── /init ───────────────────────────────────────────────────────────
 
     def _handle_init(self):
         req = _read_json(self)
@@ -374,7 +1073,11 @@ class MasterHandler(BaseHTTPRequestHandler):
 
         try:
             with job.lock:
-                _ensure_job_workers(self.server, job)
+                _ensure_initial_job_workers(self.server, job)
+                if not job.shards:
+                    raise RuntimeError("no initial workers are configured for this job")
+                job.routing_mode = "centroid" if len(job.shards) <= 1 else "bootstrap"
+                _refresh_activation_wait_state(self.server, job)
         except Exception as ex:
             _json_response(self, 502, {"ok": False, "error": str(ex)})
             return
@@ -390,10 +1093,9 @@ class MasterHandler(BaseHTTPRequestHandler):
                 "job_id": job_id,
                 "num_shards": len(job.shards),
                 "registered_workers": len(_snapshot_registered_workers(self.server)),
+                "routing_mode": job.routing_mode,
             },
         )
-
-    # ── /add_batch ──────────────────────────────────────────────────────
 
     def _handle_add_batch(self):
         content_len = int(self.headers.get("Content-Length", "0"))
@@ -427,6 +1129,7 @@ class MasterHandler(BaseHTTPRequestHandler):
         if job is None:
             _json_response(self, 404, {"ok": False, "error": "job not initialized"})
             return
+
         with job.lock:
             if job.finalized:
                 _json_response(self, 409, {"ok": False, "error": "job already finalized"})
@@ -437,110 +1140,111 @@ class MasterHandler(BaseHTTPRequestHandler):
             if dim != job.dim:
                 _json_response(self, 400, {"ok": False, "error": f"dim mismatch: batch {dim}, job {job.dim}"})
                 return
+            if with_meta_index != job.with_meta_index:
+                _json_response(self, 400, {"ok": False, "error": "with_meta_index changed within the same job"})
+                return
 
             expected_bytes = num * dim * 4
             if len(vec_bytes) != expected_bytes:
                 _json_response(
-                    self, 400,
+                    self,
+                    400,
                     {"ok": False, "error": f"invalid vector payload bytes={len(vec_bytes)}, expected={expected_bytes}"},
                 )
                 return
 
-            try:
-                active_shards = _ensure_job_workers(self.server, job)
-            except Exception as ex:
-                job.error = str(ex)
-                _json_response(self, 502, {"ok": False, "error": str(ex)})
-                return
-
-            if not active_shards:
+            active = _active_shards(job)
+            if not active:
                 _json_response(
                     self,
                     429,
-                    {"ok": False, "queue_full": True, "retry_after_ms": 500, "error": "no workers registered yet"},
+                    {"ok": False, "queue_full": True, "retry_after_ms": self.server.retry_after_ms, "error": "no workers registered yet"},
                 )
                 return
 
-            # Deserialize vectors once, then split based on the worker count
-            # that is active for this batch. When workers join, later batches
-            # are rebalanced over the larger shard set automatically.
             vectors = np.frombuffer(vec_bytes, dtype=np.float32).reshape(num, dim)
-            request_timeout = self.server.request_timeout
-            retries = self.server.retries
-            debug = self.server.debug
-            num_shards = len(active_shards)
+            global_ids = (np.arange(num, dtype=np.int64) + global_offset).astype(np.int64, copy=False)
+            _update_reservoir(job, vectors, self.server.reservoir_size)
 
-            def forward_sub_batch(shard: ShardInfo, sub_offset: int, local_begin: int, local_end: int):
-                sub_num = local_end - local_begin
-                sub_vectors = np.ascontiguousarray(vectors[local_begin:local_end], dtype=np.float32)
-
-                batch_id = shard.next_batch_id
-
-                worker_meta = {
-                    "job_id": job_id,
-                    "shard_id": shard.shard_id,
-                    "batch_id": batch_id,
-                    "global_offset": sub_offset,
-                    "num": sub_num,
-                    "dim": dim,
-                    "with_meta_index": with_meta_index,
-                    "normalized": normalized,
-                }
-                meta_raw = json.dumps(worker_meta).encode("utf-8")
-                payload = struct.pack("<Q", len(meta_raw)) + meta_raw + sub_vectors.tobytes()
-
-                url = f"{shard.worker.base_url}/add_batch"
-                resp = _send_batch_with_backpressure(
-                    url=url,
-                    payload=payload,
-                    request_timeout=request_timeout,
-                    retries=retries,
-                    what=f"add_batch shard {shard.shard_id} batch {batch_id}",
+            if job.routing_mode == "rebalancing":
+                _json_response(
+                    self,
+                    429,
+                    {"ok": False, "queue_full": True, "retry_after_ms": self.server.retry_after_ms, "error": "rebalance in progress"},
                 )
-                if not resp.get("ok", False):
-                    raise RuntimeError(
-                        f"worker add_batch failed shard={shard.shard_id} batch={batch_id}: {resp}"
+                return
+
+            if job.routing_mode == "bootstrap" and len(job.shards) > 1:
+                job.bootstrap_batches.append(
+                    BufferedBatch(
+                        global_ids=np.ascontiguousarray(global_ids, dtype=np.int64),
+                        vectors=np.ascontiguousarray(vectors, dtype=np.float32),
+                        normalized=normalized,
                     )
-
-                shard.next_batch_id += 1
-                shard.vectors_forwarded += sub_num
-
-                if debug:
-                    print(
-                        f"[debug] forwarded shard={shard.shard_id} batch={batch_id} "
-                        f"offset={sub_offset} num={sub_num}"
+                )
+                job.bootstrap_vector_count += num
+                try:
+                    bootstrap_ready = _bootstrap_if_ready(self.server, job, force=False)
+                    if bootstrap_ready:
+                        _maybe_activate_threshold_worker(self.server, job)
+                except Exception as ex:
+                    job.error = str(ex)
+                    _json_response(self, 502, {"ok": False, "error": str(ex)})
+                    return
+                if bootstrap_ready:
+                    _json_response(
+                        self,
+                        200,
+                        {
+                            "ok": True,
+                            "job_id": job_id,
+                            "vectors_accepted": num,
+                            "buffered": False,
+                            "routing_mode": job.routing_mode,
+                        },
                     )
+                    return
+                _json_response(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        "job_id": job_id,
+                        "vectors_accepted": num,
+                        "buffered": True,
+                        "bootstrap_buffered_vectors": job.bootstrap_vector_count,
+                    },
+                )
+                return
 
-            sub_batches = []
-            for shard_index, shard in enumerate(active_shards):
-                local_s, local_e = shard_bounds(num, num_shards, shard_index)
-                if local_s >= local_e:
-                    continue
-                sub_offset = global_offset + local_s
-                sub_batches.append((shard, sub_offset, local_s, local_e))
+            if job.pending_new_workers and _maybe_start_rebalance(self.server, job):
+                _json_response(
+                    self,
+                    429,
+                    {"ok": False, "queue_full": True, "retry_after_ms": self.server.retry_after_ms, "error": "rebalance started"},
+                )
+                return
 
             try:
-                if len(sub_batches) == 1:
-                    forward_sub_batch(*sub_batches[0])
-                else:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=len(sub_batches)) as executor:
-                        futures = [executor.submit(forward_sub_batch, *sb) for sb in sub_batches]
-                        for f in concurrent.futures.as_completed(futures):
-                            f.result()
+                shards_touched = _forward_routed_batch(self.server, job, vectors, global_ids, normalized)
+                _maybe_activate_threshold_worker(self.server, job)
             except Exception as ex:
                 job.error = str(ex)
                 print(f"[error] add_batch forward failed: {ex}")
                 _json_response(self, 502, {"ok": False, "error": str(ex)})
                 return
 
-        _json_response(self, 200, {
-            "ok": True,
-            "job_id": job_id,
-            "vectors_accepted": num,
-            "shards_touched": len(sub_batches),
-        })
-
-    # ── /finalize ───────────────────────────────────────────────────────
+        _json_response(
+            self,
+            200,
+            {
+                "ok": True,
+                "job_id": job_id,
+                "vectors_accepted": num,
+                "shards_touched": shards_touched,
+                "routing_mode": job.routing_mode,
+            },
+        )
 
     def _handle_finalize(self):
         req = _read_json(self)
@@ -557,19 +1261,45 @@ class MasterHandler(BaseHTTPRequestHandler):
             _json_response(self, 404, {"ok": False, "error": "job not found"})
             return
 
+        while True:
+            with job.lock:
+                if job.error is not None:
+                    _json_response(self, 500, {"ok": False, "error": f"job error: {job.error}"})
+                    return
+                if job.finalized:
+                    _json_response(self, 200, {"ok": True, "already_finalized": True})
+                    return
+                if job.routing_mode == "bootstrap" and job.bootstrap_batches:
+                    try:
+                        _bootstrap_if_ready(self.server, job, force=True)
+                    except Exception as ex:
+                        job.error = str(ex)
+                        _json_response(self, 502, {"ok": False, "error": str(ex)})
+                        return
+                try:
+                    _maybe_activate_threshold_worker(self.server, job)
+                except Exception as ex:
+                    job.error = str(ex)
+                    _json_response(self, 502, {"ok": False, "error": str(ex)})
+                    return
+                if job.pending_new_workers and job.routing_mode != "rebalancing":
+                    _maybe_start_rebalance(self.server, job)
+                rebalance_thread = job.rebalance_thread
+
+            if rebalance_thread is None:
+                break
+            rebalance_thread.join()
+
         with job.lock:
-            if job.finalized:
-                _json_response(self, 200, {"ok": True, "already_finalized": True})
-                return
             if job.error is not None:
                 _json_response(self, 500, {"ok": False, "error": f"job error: {job.error}"})
                 return
 
             finalize_timeout = self.server.finalize_timeout
             retries = self.server.retries
-
             shard_results = []
-            for shard in job.shards:
+
+            for shard in sorted(job.shards, key=lambda item: item.worker.worker_id):
                 fin_req = {"job_id": job_id, "shard_id": shard.shard_id}
                 url = f"{shard.worker.base_url}/finalize"
                 try:
@@ -580,11 +1310,7 @@ class MasterHandler(BaseHTTPRequestHandler):
                         f"finalize shard {shard.shard_id}",
                     )
                     if not resp.get("ok", False):
-                        err_msg = f"worker finalize failed shard {shard.shard_id}: {resp}"
-                        print(f"[error] {err_msg}")
-                        job.error = err_msg
-                        _json_response(self, 502, {"ok": False, "error": err_msg})
-                        return
+                        raise RuntimeError(f"worker finalize failed shard {shard.shard_id}: {resp}")
                 except Exception as ex:
                     err_msg = f"worker finalize failed shard {shard.shard_id}: {ex}"
                     print(f"[error] {err_msg}")
@@ -592,16 +1318,23 @@ class MasterHandler(BaseHTTPRequestHandler):
                     _json_response(self, 502, {"ok": False, "error": err_msg})
                     return
 
-                shard_results.append({
-                    "shard_id": shard.shard_id,
-                    "worker_id": shard.worker.worker_id,
-                    "worker": f"{shard.worker.host}:{shard.worker.port}",
-                    "vectors_ingested": resp.get("vectors_ingested", 0),
-                    "save_dir": resp.get("save_dir", ""),
-                    "add_time_s": resp.get("add_time_s", 0.0),
-                    "finalize_time_s": resp.get("finalize_time_s", 0.0),
-                    "elapsed_s": resp.get("elapsed_s", 0.0),
-                })
+                centroid = np.asarray(resp.get("centroid", np.zeros(job.dim, dtype=np.float32).tolist()), dtype=np.float32)
+                job.worker_centroids[shard.worker.worker_id] = centroid
+                job.worker_counts[shard.worker.worker_id] = int(resp.get("active_vectors", resp.get("vectors_ingested", 0)))
+
+                shard_results.append(
+                    {
+                        "shard_id": shard.shard_id,
+                        "worker_id": shard.worker.worker_id,
+                        "worker": f"{shard.worker.host}:{shard.worker.port}",
+                        "vectors_ingested": resp.get("vectors_ingested", 0),
+                        "active_vectors": resp.get("active_vectors", 0),
+                        "save_dir": resp.get("save_dir", ""),
+                        "add_time_s": resp.get("add_time_s", 0.0),
+                        "finalize_time_s": resp.get("finalize_time_s", 0.0),
+                        "elapsed_s": resp.get("elapsed_s", 0.0),
+                    }
+                )
                 print(
                     f"[finalize] shard={shard.shard_id} saved={resp.get('save_dir')} "
                     f"vectors={resp.get('vectors_ingested')} "
@@ -609,14 +1342,24 @@ class MasterHandler(BaseHTTPRequestHandler):
                     f"worker_finalize={resp.get('finalize_time_s', 0):.3f}s"
                 )
 
+            centers_path = Path(job.output_dir) / "centers"
+            _write_centers_file(centers_path, job.worker_centroids, job.dim)
+            job.centers_file = str(centers_path)
             job.finalized = True
 
-        _json_response(self, 200, {"ok": True, "job_id": job_id, "shards": shard_results})
+        _json_response(
+            self,
+            200,
+            {
+                "ok": True,
+                "job_id": job_id,
+                "shards": shard_results,
+                "centers_file": job.centers_file,
+            },
+        )
 
         if getattr(self.server, "exit_after_finalize", False):
             threading.Thread(target=self.server.shutdown, daemon=True).start()
-
-    # ── /status ─────────────────────────────────────────────────────────
 
     def _handle_status(self, parsed):
         qs = parse_qs(parsed.query)
@@ -631,46 +1374,89 @@ class MasterHandler(BaseHTTPRequestHandler):
                 _json_response(self, 404, {"ok": False, "error": "job not found"})
                 return
         with job.lock:
+            active_worker_ids = sorted(_active_worker_ids(job))
+            idle_registered_worker_ids = _idle_registered_threshold_worker_ids(self.server, job)
+            next_activation_candidate = _next_threshold_candidate_id(self.server, job)
+            threshold_breached = bool(_threshold_breached_worker_ids(self.server, job))
             shard_info = []
-            for s in job.shards:
-                shard_info.append({
-                    "shard_id": s.shard_id,
-                    "worker_id": s.worker.worker_id,
-                    "worker": f"{s.worker.host}:{s.worker.port}",
-                    "next_batch_id": s.next_batch_id,
-                    "vectors_forwarded": s.vectors_forwarded,
-                })
-            _json_response(self, 200, {
-                "ok": True,
-                "job_id": job_id,
-                "dim": job.dim,
-                "algo": job.algo,
-                "registered_workers": len(_snapshot_registered_workers(self.server)),
-                "initialized_shards": len(job.shards),
-                "finalized": job.finalized,
-                "error": job.error,
-                "shards": shard_info,
-            })
-
-    # ── /shutdown ───────────────────────────────────────────────────────
+            for shard in sorted(job.shards, key=lambda item: item.worker.worker_id):
+                shard_info.append(
+                    {
+                        "shard_id": shard.shard_id,
+                        "worker_id": shard.worker.worker_id,
+                        "worker": f"{shard.worker.host}:{shard.worker.port}",
+                        "next_batch_id": shard.next_batch_id,
+                        "vectors_forwarded": shard.vectors_forwarded,
+                        "active": shard.worker.worker_id in active_worker_ids,
+                        "pending_rebalance": shard.worker.worker_id in job.pending_new_workers,
+                        "worker_count": int(job.worker_counts.get(shard.worker.worker_id, 0)),
+                    }
+                )
+            _json_response(
+                self,
+                200,
+                {
+                    "ok": True,
+                    "job_id": job_id,
+                    "dim": job.dim,
+                    "algo": job.algo,
+                    "registered_workers": len(_snapshot_registered_workers(self.server)),
+                    "initialized_shards": len(job.shards),
+                    "routing_mode": job.routing_mode,
+                    "routing_epoch": job.routing_epoch,
+                    "pending_new_workers": sorted(job.pending_new_workers),
+                    "bootstrap_vector_count": job.bootstrap_vector_count,
+                    "reservoir_seen": job.reservoir_seen,
+                    "activation_threshold_vectors": int(getattr(self.server, "activation_threshold_vectors", 0)),
+                    "threshold_breached": threshold_breached,
+                    "activation_waiting_for_worker": bool(job.activation_waiting_for_worker),
+                    "next_activation_candidate": next_activation_candidate,
+                    "active_workers": active_worker_ids,
+                    "idle_registered_workers": idle_registered_worker_ids,
+                    "finalized": job.finalized,
+                    "error": job.error,
+                    "centers_file": job.centers_file,
+                    "shards": shard_info,
+                },
+            )
 
     def _handle_shutdown(self):
         _json_response(self, 200, {"ok": True, "message": "master shutting down"})
         threading.Thread(target=self.server.shutdown, daemon=True).start()
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
-
 def main():
-    parser = argparse.ArgumentParser(description="Distributed SPTAG shard build master (HTTP server).")
+    parser = argparse.ArgumentParser(description="Distributed SPTAG shard build master with rebalance.")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=19090)
-    parser.add_argument("--workers_file", default=None, help='JSON array: [{"host":"...","port":18080}, ...]')
-    parser.add_argument("--workers", nargs="*", default=None, help="Inline worker list: host:port host:port ...")
+    parser.add_argument("--workers_file", default=None, help='JSON array for initial workers: [{"worker_id":1,"host":"...","port":18080}, ...]')
+    parser.add_argument("--workers", nargs="*", default=None, help="Inline initial worker list: worker_id@host:port ...")
+    parser.add_argument(
+        "--threshold_join_workers_file",
+        default=None,
+        help='JSON array for threshold-activated workers: [{"worker_id":3,"host":"...","port":18082}, ...]',
+    )
+    parser.add_argument(
+        "--threshold_join_workers",
+        nargs="*",
+        default=None,
+        help="Inline threshold-activated worker list: worker_id@host:port ...",
+    )
+    parser.add_argument(
+        "--activation_threshold_vectors",
+        type=int,
+        default=0,
+        help="Activate one idle threshold worker when any active worker reaches this many active vectors.",
+    )
     parser.add_argument("--request_timeout", type=int, default=60)
     parser.add_argument("--finalize_timeout", type=int, default=600)
+    parser.add_argument("--rebalance_timeout", type=int, default=1800)
     parser.add_argument("--retries", type=int, default=5)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--bootstrap_sample_size", type=int, default=50000)
+    parser.add_argument("--reservoir_size", type=int, default=50000)
+    parser.add_argument("--retry_after_ms", type=int, default=1000)
+    parser.add_argument("--disable_rebalance", action="store_true")
     parser.add_argument(
         "--no_exit_after_finalize",
         action="store_true",
@@ -681,22 +1467,62 @@ def main():
     server = ThreadingHTTPServer((args.host, args.port), MasterHandler)
     server.worker_lock = threading.Lock()
     server.workers = {}
+    server.worker_key_to_id = {}
     server.next_worker_id = 0
     server.request_timeout = args.request_timeout
     server.finalize_timeout = args.finalize_timeout
+    server.rebalance_timeout = args.rebalance_timeout
     server.retries = args.retries
     server.debug = args.debug
+    server.bootstrap_sample_size = max(1, args.bootstrap_sample_size)
+    server.reservoir_size = max(1, args.reservoir_size)
+    server.retry_after_ms = max(1, args.retry_after_ms)
+    server.rebalance_enabled = not args.disable_rebalance
     server.exit_after_finalize = not args.no_exit_after_finalize
+    server.activation_threshold_vectors = max(0, int(args.activation_threshold_vectors))
 
-    workers = _resolve_workers(args)
-    for worker in workers:
-        registered, _ = _register_worker(server, worker.host, worker.port)
-        print(f"[worker] configured worker_id={registered.worker_id} addr={registered.host}:{registered.port}")
+    initial_workers = _resolve_workers(args.workers_file, args.workers, "initial workers")
+    threshold_workers = _resolve_workers(
+        args.threshold_join_workers_file,
+        args.threshold_join_workers,
+        "threshold join workers",
+    )
+    initial_ids = {worker.worker_id for worker in initial_workers}
+    threshold_ids = {worker.worker_id for worker in threshold_workers}
+    overlap = sorted(initial_ids.intersection(threshold_ids))
+    if overlap:
+        raise ValueError(f"worker ids cannot appear in both initial and threshold worker sets: {overlap}")
 
+    server.initial_worker_ids = sorted(initial_ids)
+    server.threshold_join_worker_ids = [worker.worker_id for worker in threshold_workers]
+
+    for worker in initial_workers:
+        configured = _add_configured_worker(server, worker, registered=True)
+        print(f"[worker] initial worker_id={configured.worker_id} addr={configured.host}:{configured.port}")
+    for worker in threshold_workers:
+        configured = _add_configured_worker(server, worker, registered=False)
+        print(f"[worker] threshold worker_id={configured.worker_id} addr={configured.host}:{configured.port}")
+
+    if server.activation_threshold_vectors > 0 and not server.threshold_join_worker_ids:
+        raise ValueError("activation_threshold_vectors requires at least one threshold join worker")
+    if server.activation_threshold_vectors > 0 and not server.rebalance_enabled:
+        raise ValueError("activation_threshold_vectors requires rebalance to be enabled")
+
+    configured_workers = _snapshot_workers(server)
     registered_workers = _snapshot_registered_workers(server)
-    print(f"Master listening on {args.host}:{args.port} workers={len(registered_workers)}")
-    for w in registered_workers:
-        print(f"  worker[{w.worker_id}]: {w.host}:{w.port}")
+    print(f"Master listening on {args.host}:{args.port} workers={len(configured_workers)}")
+    print(
+        f"  bootstrap_sample_size={server.bootstrap_sample_size} "
+        f"reservoir_size={server.reservoir_size} "
+        f"rebalance_enabled={server.rebalance_enabled} "
+        f"activation_threshold_vectors={server.activation_threshold_vectors}"
+    )
+    print(f"  initial_worker_ids={server.initial_worker_ids}")
+    print(f"  threshold_join_worker_ids={server.threshold_join_worker_ids}")
+    print(f"  registered_workers={len(registered_workers)}")
+    for worker in configured_workers:
+        status = "registered" if worker.registered else "idle"
+        print(f"  worker[{worker.worker_id}]: {worker.host}:{worker.port} ({status})")
     server.serve_forever()
 
 

@@ -88,6 +88,7 @@ sudo make install
 
 > Build SPTAG
 ```bash
+git submodule update --init --recursive
 mkdir build
 cd build 
 cmake -DCMAKE_BUILD_TYPE=Release -DSPDK=OFF -DROCKSDB=OFF ..

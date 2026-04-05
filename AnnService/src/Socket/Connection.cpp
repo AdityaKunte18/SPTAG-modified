@@ -26,15 +26,38 @@ Connection::Connection(ConnectionID p_connectionID, boost::asio::ip::tcp::socket
 
 void Connection::Start()
 {
-    SPTAGLIB_LOG(Helper::LogLevel::LL_Debug, "Connection Start, local: %u, remote: %s:%u\n",
-                 static_cast<uint32_t>(m_socket.local_endpoint().port()),
-                 m_socket.remote_endpoint().address().to_string().c_str(),
-                 static_cast<uint32_t>(m_socket.remote_endpoint().port()));
-
     if (!m_stopped.exchange(false))
     {
         return;
     }
+
+    boost::system::error_code ec;
+    uint32_t localPort = 0;
+    uint32_t remotePort = 0;
+    std::string remoteAddr("<disconnected>");
+
+    auto localEndpoint = m_socket.local_endpoint(ec);
+    if (!ec)
+    {
+        localPort = static_cast<uint32_t>(localEndpoint.port());
+    }
+
+    ec.clear();
+    auto remoteEndpoint = m_socket.remote_endpoint(ec);
+    if (!ec)
+    {
+        remotePort = static_cast<uint32_t>(remoteEndpoint.port());
+        remoteAddr = remoteEndpoint.address().to_string(ec);
+        if (ec)
+        {
+            remoteAddr = "<disconnected>";
+        }
+    }
+
+    SPTAGLIB_LOG(Helper::LogLevel::LL_Debug, "Connection Start, local: %u, remote: %s:%u\n",
+                 localPort,
+                 remoteAddr.c_str(),
+                 remotePort);
 
     SendRegister();
     AsyncReadHeader();
@@ -42,24 +65,46 @@ void Connection::Start()
 
 void Connection::Stop()
 {
-    SPTAGLIB_LOG(Helper::LogLevel::LL_Debug, "Connection Stop, local: %u, remote: %s:%u\n",
-                 static_cast<uint32_t>(m_socket.local_endpoint().port()),
-                 m_socket.remote_endpoint().address().to_string().c_str(),
-                 static_cast<uint32_t>(m_socket.remote_endpoint().port()));
-
     if (m_stopped.exchange(true))
     {
         return;
     }
 
-    boost::system::error_code errCode;
-    if (m_heartbeatStarted.exchange(false))
+    boost::system::error_code ec;
+    uint32_t localPort = 0;
+    uint32_t remotePort = 0;
+    std::string remoteAddr("<disconnected>");
+
+    auto localEndpoint = m_socket.local_endpoint(ec);
+    if (!ec)
     {
-        m_heartbeatTimer.cancel(errCode);
+        localPort = static_cast<uint32_t>(localEndpoint.port());
     }
 
-    m_socket.shutdown(boost::asio::ip::tcp::socket::shutdown_both, errCode);
-    m_socket.close(errCode);
+    ec.clear();
+    auto remoteEndpoint = m_socket.remote_endpoint(ec);
+    if (!ec)
+    {
+        remotePort = static_cast<uint32_t>(remoteEndpoint.port());
+        remoteAddr = remoteEndpoint.address().to_string(ec);
+        if (ec)
+        {
+            remoteAddr = "<disconnected>";
+        }
+    }
+
+    SPTAGLIB_LOG(Helper::LogLevel::LL_Debug, "Connection Stop, local: %u, remote: %s:%u\n",
+                 localPort,
+                 remoteAddr.c_str(),
+                 remotePort);
+
+    if (m_heartbeatStarted.exchange(false))
+    {
+        m_heartbeatTimer.cancel(ec);
+    }
+
+    m_socket.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
+    m_socket.close(ec);
 }
 
 void Connection::StartHeartbeat(std::size_t p_intervalSeconds)
