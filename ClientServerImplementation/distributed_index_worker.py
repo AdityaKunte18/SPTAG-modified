@@ -35,7 +35,7 @@ from typing import Iterator
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
-from Release import SPTAG
+import SPTAG
 
 
 def _job_key(job_id: str, shard_id: int) -> str:
@@ -326,6 +326,7 @@ class JobState:
     init_time_s: float = 0.0
     add_time_s: float = 0.0
     finalize_time_s: float = 0.0
+    checkpoint_time_s: float = 0.0
 
     q: "queue.Queue[tuple[int,np.ndarray,int,bool,bytes]]" | None = None
     stop_event: threading.Event | None = None
@@ -337,6 +338,12 @@ class JobState:
     last_routing_epoch: int = 0
     rebalance_plan: RebalancePlan | None = None
     applied_migration_batches: set[tuple[int, int, int]] = field(default_factory=set)
+    rebalance_started_at: float = 0.0
+    last_rebalance_prepare_time_s: float = 0.0
+    last_rebalance_migrate_time_s: float = 0.0
+    last_rebalance_rebuild_time_s: float = 0.0
+    last_rebalance_total_time_s: float = 0.0
+    rebalance_history: list[dict] = field(default_factory=list, repr=False)
 
 
 STATE: dict[str, JobState] = {}
@@ -431,6 +438,21 @@ def _rebuild_index_from_store(st: JobState, batch_size: int) -> tuple[int, np.nd
     st.vectors_ingested = st.local_store.active_count
     st.add_time_s = add_time_s
     return st.local_store.active_count, st.local_store.centroid()
+
+
+def _save_index_snapshot(st: JobState, target_dir: str) -> tuple[float, np.ndarray, bool]:
+    os.makedirs(target_dir, exist_ok=True)
+    centroid = st.local_store.centroid()
+    if st.local_store.active_count <= 0:
+        return 0.0, centroid, True
+
+    t0 = time.time()
+    st.index.UpdateIndex()
+    ok = st.index.Save(target_dir)
+    elapsed = time.time() - t0
+    if not ok:
+        raise RuntimeError(f"failed to save index to {target_dir}")
+    return elapsed, centroid, False
 
 
 def _consumer_loop(key: str) -> None:
@@ -564,6 +586,9 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     "error": st.error,
                     "routing_epoch": st.last_routing_epoch,
                     "rebalance_epoch": st.rebalance_plan.routing_epoch if st.rebalance_plan is not None else None,
+                    "rebalance_history_size": len(st.rebalance_history),
+                    "last_rebalance": st.rebalance_history[-1] if st.rebalance_history else None,
+                    "rebalance_history": list(st.rebalance_history),
                 },
             )
 
@@ -576,6 +601,8 @@ class WorkerHandler(BaseHTTPRequestHandler):
             return self._handle_migrate_batch()
         if self.path == "/rebalance":
             return self._handle_rebalance()
+        if self.path == "/checkpoint":
+            return self._handle_checkpoint()
         if self.path == "/finalize":
             return self._handle_finalize()
         if self.path == "/shutdown":
@@ -854,12 +881,21 @@ class WorkerHandler(BaseHTTPRequestHandler):
         except Exception as ex:
             with st.lock:
                 st.error = f"{type(ex).__name__}: {ex}"
+                st.rebalance_history.append(
+                    {
+                        "routing_epoch": int(routing_epoch),
+                        "worker_id": int(st.shard_id),
+                        "phase": str(phase),
+                        "error": str(ex),
+                    }
+                )
             _json_response(self, 500, {"ok": False, "error": str(ex)})
             return
 
         _json_response(self, 400, {"ok": False, "error": f"unknown rebalance phase {phase}"})
 
     def _handle_rebalance_prepare(self, st: JobState, routing_epoch: int, req: dict):
+        phase_t0 = time.time()
         centroids = np.asarray(req["centroids"], dtype=np.float32)
         assigned_centroid_idx = int(req["assigned_centroid_idx"])
         centroid_to_worker = {int(k): int(v) for k, v in req["centroid_to_worker"].items()}
@@ -872,6 +908,8 @@ class WorkerHandler(BaseHTTPRequestHandler):
             if st.finalized:
                 raise RuntimeError("job already finalized")
             if routing_epoch <= st.last_routing_epoch:
+                elapsed = time.time() - phase_t0
+                st.last_rebalance_prepare_time_s = elapsed
                 _json_response(
                     self,
                     200,
@@ -880,9 +918,16 @@ class WorkerHandler(BaseHTTPRequestHandler):
                         "phase": "prepare",
                         "duplicate": True,
                         "active_count": st.local_store.active_count,
+                        "phase_time_s": elapsed,
+                        "rebalance_total_time_s": st.last_rebalance_total_time_s,
                     },
                 )
                 return
+            st.rebalance_started_at = time.time()
+            st.last_rebalance_prepare_time_s = 0.0
+            st.last_rebalance_migrate_time_s = 0.0
+            st.last_rebalance_rebuild_time_s = 0.0
+            st.last_rebalance_total_time_s = 0.0
             st.rebalance_plan = RebalancePlan(
                 routing_epoch=routing_epoch,
                 centroids=centroids,
@@ -891,7 +936,13 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 worker_urls=worker_urls,
                 scan_limit=st.local_store.vector_count,
             )
+            elapsed = time.time() - phase_t0
+            st.last_rebalance_prepare_time_s = elapsed
 
+        print(
+            f"[rebalance] shard={st.shard_id} epoch={routing_epoch} "
+            f"phase=prepare active={st.local_store.active_count} elapsed={elapsed:.3f}s"
+        )
         _json_response(
             self,
             200,
@@ -901,10 +952,12 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 "routing_epoch": routing_epoch,
                 "scan_limit": st.local_store.vector_count,
                 "active_count": st.local_store.active_count,
+                "phase_time_s": elapsed,
             },
         )
 
     def _handle_rebalance_migrate(self, st: JobState, routing_epoch: int):
+        phase_t0 = time.time()
         _wait_for_queue_drain(st)
         with st.lock:
             if st.error is not None:
@@ -982,7 +1035,13 @@ class WorkerHandler(BaseHTTPRequestHandler):
 
         with st.lock:
             st.vectors_ingested = st.local_store.active_count
+            elapsed = time.time() - phase_t0
+            st.last_rebalance_migrate_time_s = elapsed
 
+        print(
+            f"[rebalance] shard={st.shard_id} epoch={routing_epoch} "
+            f"phase=migrate moved={moved_vectors} kept={kept_vectors} elapsed={elapsed:.3f}s"
+        )
         _json_response(
             self,
             200,
@@ -993,10 +1052,12 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 "moved_vectors": moved_vectors,
                 "kept_vectors": kept_vectors,
                 "active_count": st.local_store.active_count,
+                "phase_time_s": elapsed,
             },
         )
 
     def _handle_rebalance_rebuild(self, st: JobState, routing_epoch: int):
+        phase_t0 = time.time()
         _wait_for_queue_drain(st)
         with st.lock:
             if st.error is not None:
@@ -1008,7 +1069,28 @@ class WorkerHandler(BaseHTTPRequestHandler):
             active_count, centroid = _rebuild_index_from_store(st, batch_size)
             st.last_routing_epoch = routing_epoch
             st.rebalance_plan = None
+            elapsed = time.time() - phase_t0
+            st.last_rebalance_rebuild_time_s = elapsed
+            if st.rebalance_started_at > 0:
+                st.last_rebalance_total_time_s = time.time() - st.rebalance_started_at
+            else:
+                st.last_rebalance_total_time_s = elapsed
+            st.rebalance_history.append(
+                {
+                    "routing_epoch": int(routing_epoch),
+                    "worker_id": int(st.shard_id),
+                    "active_count": int(active_count),
+                    "prepare_phase_s": round(st.last_rebalance_prepare_time_s, 6),
+                    "migrate_phase_s": round(st.last_rebalance_migrate_time_s, 6),
+                    "rebuild_phase_s": round(st.last_rebalance_rebuild_time_s, 6),
+                    "rebalance_total_s": round(st.last_rebalance_total_time_s, 6),
+                }
+            )
 
+        print(
+            f"[rebalance] shard={st.shard_id} epoch={routing_epoch} "
+            f"phase=rebuild active={active_count} elapsed={elapsed:.3f}s total={st.last_rebalance_total_time_s:.3f}s"
+        )
         _json_response(
             self,
             200,
@@ -1018,6 +1100,71 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 "routing_epoch": routing_epoch,
                 "active_count": active_count,
                 "centroid": centroid.tolist(),
+                "phase_time_s": elapsed,
+                "rebalance_total_time_s": st.last_rebalance_total_time_s,
+            },
+        )
+
+    def _handle_checkpoint(self):
+        req = _read_json(self)
+        try:
+            job_id = str(req["job_id"])
+            shard_id = int(req["shard_id"])
+            checkpoint_dir = str(req["checkpoint_dir"])
+        except Exception as ex:
+            _json_response(self, 400, {"ok": False, "error": f"invalid checkpoint payload: {ex}"})
+            return
+
+        key = _job_key(job_id, shard_id)
+        st = _get_state(key)
+        if st is None:
+            _json_response(self, 404, {"ok": False, "error": "job not found"})
+            return
+
+        with st.lock:
+            if st.error is not None:
+                _json_response(self, 500, {"ok": False, "error": f"worker error: {st.error}"})
+                return
+            if st.rebalance_plan is not None:
+                _json_response(self, 409, {"ok": False, "error": "rebalance still in progress"})
+                return
+
+        _wait_for_queue_drain(st)
+        with st.lock:
+            if st.error is not None:
+                _json_response(self, 500, {"ok": False, "error": f"worker error: {st.error}"})
+                return
+            checkpoint_elapsed, centroid, empty = _save_index_snapshot(st, checkpoint_dir)
+            st.checkpoint_time_s = checkpoint_elapsed
+
+        print(
+            f"[checkpoint] shard={shard_id} dir={checkpoint_dir} "
+            f"active={st.local_store.active_count} elapsed={checkpoint_elapsed:.3f}s"
+        )
+        _json_response(
+            self,
+            200,
+            {
+                "ok": True,
+                "job_id": job_id,
+                "shard_id": shard_id,
+                "checkpoint_dir": checkpoint_dir,
+                "vectors_ingested": st.vectors_ingested,
+                "active_vectors": st.local_store.active_count,
+                "checkpoint_time_s": checkpoint_elapsed,
+                "add_time_s": st.add_time_s,
+                "elapsed_s": max(0.0, time.time() - st.init_time_s),
+                "last_applied_batch_id": st.last_batch_id,
+                "centroid": centroid.tolist(),
+                "routing_epoch": st.last_routing_epoch,
+                "empty": empty,
+                "rebalance_prepare_time_s": st.last_rebalance_prepare_time_s,
+                "rebalance_migrate_time_s": st.last_rebalance_migrate_time_s,
+                "rebalance_rebuild_time_s": st.last_rebalance_rebuild_time_s,
+                "rebalance_total_time_s": st.last_rebalance_total_time_s,
+                "rebalance_history_size": len(st.rebalance_history),
+                "last_rebalance": st.rebalance_history[-1] if st.rebalance_history else None,
+                "rebalance_history": list(st.rebalance_history),
             },
         )
 
@@ -1074,22 +1221,17 @@ class WorkerHandler(BaseHTTPRequestHandler):
                         "centroid": centroid.tolist(),
                         "routing_epoch": st.last_routing_epoch,
                         "empty": True,
+                        "rebalance_history_size": len(st.rebalance_history),
+                        "last_rebalance": st.rebalance_history[-1] if st.rebalance_history else None,
+                        "rebalance_history": list(st.rebalance_history),
                     },
                 )
                 if getattr(self.server, "exit_after_finalize", False):
                     threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
-            t_fin_start = time.time()
-            st.index.UpdateIndex()
-            os.makedirs(st.save_dir, exist_ok=True)
-            ok = st.index.Save(st.save_dir)
-            fin_elapsed = time.time() - t_fin_start
-            if not ok:
-                _json_response(self, 500, {"ok": False, "error": f"failed to save index to {st.save_dir}"})
-                return
+            fin_elapsed, centroid, _ = _save_index_snapshot(st, st.save_dir)
             st.finalized = True
             st.finalize_time_s = fin_elapsed
-            centroid = st.local_store.centroid()
 
         _json_response(
             self,
@@ -1107,6 +1249,14 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 "last_applied_batch_id": st.last_batch_id,
                 "centroid": centroid.tolist(),
                 "routing_epoch": st.last_routing_epoch,
+                "checkpoint_time_s": st.checkpoint_time_s,
+                "rebalance_prepare_time_s": st.last_rebalance_prepare_time_s,
+                "rebalance_migrate_time_s": st.last_rebalance_migrate_time_s,
+                "rebalance_rebuild_time_s": st.last_rebalance_rebuild_time_s,
+                "rebalance_total_time_s": st.last_rebalance_total_time_s,
+                "rebalance_history_size": len(st.rebalance_history),
+                "last_rebalance": st.rebalance_history[-1] if st.rebalance_history else None,
+                "rebalance_history": list(st.rebalance_history),
             },
         )
 

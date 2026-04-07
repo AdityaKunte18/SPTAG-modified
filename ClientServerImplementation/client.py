@@ -165,8 +165,18 @@ def main():
     parser.add_argument("--threads", type=int, default=max(1, os.cpu_count() or 1))
     parser.add_argument("--with_meta_index", action="store_true")
     parser.add_argument("--request_timeout", type=int, default=60)
+    parser.add_argument("--checkpoint_timeout", type=int, default=600)
     parser.add_argument("--finalize_timeout", type=int, default=600)
     parser.add_argument("--retries", type=int, default=5)
+    parser.add_argument("--skip_init", action="store_true", help="Skip /init and append to an existing job")
+    parser.add_argument(
+        "--final_action",
+        default="finalize",
+        choices=["none", "checkpoint", "finalize"],
+        help="Action to take after sending this phase's batches",
+    )
+    parser.add_argument("--checkpoint_id", default="", help="Checkpoint identifier when --final_action=checkpoint")
+    parser.add_argument("--phase_label", default="", help="Optional label for logging this client phase")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
@@ -205,29 +215,34 @@ def main():
 
     print(f"Dataset: {base_path} (dim={dim}, total={total_points})")
     print(f"Subset: [{subset_start}, {subset_end}) size={subset_n}")
+    if args.phase_label:
+        print(f"Phase: {args.phase_label}")
 
     # ── Init ────────────────────────────────────────────────────────────
-    init_payload = {
-        "job_id": args.job_id,
-        "algo": args.algo,
-        "dist": args.dist,
-        "dim": dim,
-        "output_dir": args.output_dir,
-        "threads": args.threads,
-        "with_meta_index": args.with_meta_index,
-    }
-    init_url = f"{master_url}/init"
-    init_resp = _post_with_retry(
-        init_url,
-        lambda: _http_json_post(init_url, init_payload, args.request_timeout),
-        args.retries,
-        "init",
-    )
-    if not init_resp.get("ok", False):
-        raise RuntimeError(f"Master /init failed: {init_resp}")
-    num_shards = init_resp.get("num_shards", "?")
-    registered_workers = init_resp.get("registered_workers", num_shards)
-    print(f"Master initialized: {num_shards} shard(s) active, {registered_workers} worker(s) registered")
+    if args.skip_init:
+        print(f"Master init skipped for existing job: {args.job_id}")
+    else:
+        init_payload = {
+            "job_id": args.job_id,
+            "algo": args.algo,
+            "dist": args.dist,
+            "dim": dim,
+            "output_dir": args.output_dir,
+            "threads": args.threads,
+            "with_meta_index": args.with_meta_index,
+        }
+        init_url = f"{master_url}/init"
+        init_resp = _post_with_retry(
+            init_url,
+            lambda: _http_json_post(init_url, init_payload, args.request_timeout),
+            args.retries,
+            "init",
+        )
+        if not init_resp.get("ok", False):
+            raise RuntimeError(f"Master /init failed: {init_resp}")
+        num_shards = init_resp.get("num_shards", "?")
+        registered_workers = init_resp.get("registered_workers", num_shards)
+        print(f"Master initialized: {num_shards} shard(s) active, {registered_workers} worker(s) registered")
 
     # ── Stream batches ──────────────────────────────────────────────────
     add_t0 = time.time()
@@ -281,29 +296,57 @@ def main():
     qps = (subset_n / add_elapsed) if add_elapsed > 0 else 0.0
     print(f"[add done] vectors={subset_n} batches={batch_count} send_time={add_elapsed:.3f}s ({qps:.1f} vec/s)")
 
-    # ── Finalize ────────────────────────────────────────────────────────
-    finalize_url = f"{master_url}/finalize"
-    finalize_payload = {"job_id": args.job_id}
-    finalize_resp = _post_with_retry(
-        finalize_url,
-        lambda: _http_json_post(finalize_url, finalize_payload, args.finalize_timeout),
-        args.retries,
-        "finalize",
-    )
-    if not finalize_resp.get("ok", False):
-        raise RuntimeError(f"Master /finalize failed: {finalize_resp}")
-
-    shards = finalize_resp.get("shards", [])
-    for s in shards:
-        print(
-            f"[finalize] shard={s.get('shard_id')} saved={s.get('save_dir')} "
-            f"vectors={s.get('vectors_ingested')} "
-            f"worker_add={s.get('add_time_s', 0):.3f}s "
-            f"worker_finalize={s.get('finalize_time_s', 0):.3f}s"
+    # ── Final Action ────────────────────────────────────────────────────
+    if args.final_action == "checkpoint":
+        checkpoint_url = f"{master_url}/checkpoint"
+        checkpoint_payload = {"job_id": args.job_id}
+        if args.checkpoint_id:
+            checkpoint_payload["checkpoint_id"] = args.checkpoint_id
+        checkpoint_resp = _post_with_retry(
+            checkpoint_url,
+            lambda: _http_json_post(checkpoint_url, checkpoint_payload, args.checkpoint_timeout),
+            args.retries,
+            "checkpoint",
         )
+        if not checkpoint_resp.get("ok", False):
+            raise RuntimeError(f"Master /checkpoint failed: {checkpoint_resp}")
+        print(
+            f"[checkpoint] id={checkpoint_resp.get('checkpoint_id')} "
+            f"dir={checkpoint_resp.get('checkpoint_dir')} "
+            f"centers={checkpoint_resp.get('centers_file')}"
+        )
+        for shard in checkpoint_resp.get("shards", []):
+            print(
+                f"[checkpoint] shard={shard.get('shard_id')} dir={shard.get('checkpoint_dir')} "
+                f"active={shard.get('active_vectors')} "
+                f"worker_checkpoint={shard.get('checkpoint_time_s', 0):.3f}s"
+            )
+    elif args.final_action == "finalize":
+        finalize_url = f"{master_url}/finalize"
+        finalize_payload = {"job_id": args.job_id}
+        finalize_resp = _post_with_retry(
+            finalize_url,
+            lambda: _http_json_post(finalize_url, finalize_payload, args.finalize_timeout),
+            args.retries,
+            "finalize",
+        )
+        if not finalize_resp.get("ok", False):
+            raise RuntimeError(f"Master /finalize failed: {finalize_resp}")
+
+        shards = finalize_resp.get("shards", [])
+        for s in shards:
+            print(
+                f"[finalize] shard={s.get('shard_id')} saved={s.get('save_dir')} "
+                f"vectors={s.get('vectors_ingested')} "
+                f"worker_add={s.get('add_time_s', 0):.3f}s "
+                f"worker_finalize={s.get('finalize_time_s', 0):.3f}s"
+            )
+        print(f"[finalize] centers={finalize_resp.get('centers_file')}")
+    else:
+        print("[phase done] final action skipped")
 
     total_elapsed = time.time() - total_t0
-    print("Distributed build completed successfully.")
+    print("Distributed build phase completed successfully.")
     print(f"[timing] total={total_elapsed:.3f}s add_phase={add_elapsed:.3f}s")
 
 

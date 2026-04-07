@@ -300,6 +300,7 @@ class MasterJobState:
     error: str | None = None
     init_time: float = 0.0
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
+    total_vectors_ingested: int = 0
 
     routing_mode: str = "bootstrap"
     routing_epoch: int = 0
@@ -313,6 +314,10 @@ class MasterJobState:
     rebalance_thread: threading.Thread | None = field(default=None, repr=False, compare=False)
     centers_file: str | None = None
     activation_waiting_for_worker: bool = False
+    checkpoint_history: list[dict] = field(default_factory=list, repr=False)
+    rebalance_history: list[dict] = field(default_factory=list, repr=False)
+    latest_checkpoint_dir: str | None = None
+    latest_checkpoint_centers_file: str | None = None
 
 
 STATE: dict[str, MasterJobState] = {}
@@ -533,7 +538,7 @@ def _ensure_initial_job_workers(server, job: MasterJobState) -> list[ShardInfo]:
 
 def _maybe_activate_threshold_worker(server, job: MasterJobState) -> bool:
     _refresh_activation_wait_state(server, job)
-    if int(getattr(server, "activation_threshold_vectors", 0)) <= 0:
+    if int(getattr(server, "activation_threshold_vectors", 0)) <= 0 and not getattr(server, "join_at_total_vectors", []):
         return False
     if job.routing_mode != "centroid":
         return False
@@ -541,7 +546,7 @@ def _maybe_activate_threshold_worker(server, job: MasterJobState) -> bool:
         return False
     if job.rebalance_thread is not None and job.rebalance_thread.is_alive():
         return False
-    if not _threshold_breached_worker_ids(server, job):
+    if not _activation_triggered(server, job):
         job.activation_waiting_for_worker = False
         return False
 
@@ -560,6 +565,7 @@ def _maybe_activate_threshold_worker(server, job: MasterJobState) -> bool:
     if worker is None:
         raise RuntimeError(f"threshold worker_id={next_candidate} is not configured")
 
+    current_join_milestone = _next_join_milestone(server, job)
     _init_worker_for_job(
         job=job,
         worker=worker,
@@ -568,6 +574,12 @@ def _maybe_activate_threshold_worker(server, job: MasterJobState) -> bool:
     )
     job.pending_new_workers.add(worker.worker_id)
     job.activation_waiting_for_worker = False
+    trigger_desc = (
+        f"total_vectors={job.total_vectors_ingested} milestone={current_join_milestone}"
+        if getattr(server, "join_at_total_vectors", [])
+        else f"threshold_vectors={getattr(server, 'activation_threshold_vectors', 0)}"
+    )
+    print(f"[activate] worker_id={worker.worker_id} job={job.job_id} reason={trigger_desc}")
 
     if not _maybe_start_rebalance(server, job):
         raise RuntimeError(f"failed to start rebalance after activating worker_id={worker.worker_id}")
@@ -620,6 +632,32 @@ def _threshold_breached_worker_ids(server, job: MasterJobState) -> list[int]:
     return breached
 
 
+def _initialized_threshold_worker_count(server, job: MasterJobState) -> int:
+    initialized_ids = _initialized_worker_ids(job)
+    return sum(1 for worker_id in getattr(server, "threshold_join_worker_ids", []) if worker_id in initialized_ids)
+
+
+def _next_join_milestone(server, job: MasterJobState) -> int | None:
+    milestones = list(getattr(server, "join_at_total_vectors", []))
+    idx = _initialized_threshold_worker_count(server, job)
+    if idx < 0 or idx >= len(milestones):
+        return None
+    return int(milestones[idx])
+
+
+def _join_milestone_reached(server, job: MasterJobState) -> bool:
+    next_milestone = _next_join_milestone(server, job)
+    if next_milestone is None:
+        return False
+    return int(job.total_vectors_ingested) >= int(next_milestone)
+
+
+def _activation_triggered(server, job: MasterJobState) -> bool:
+    if getattr(server, "join_at_total_vectors", []):
+        return _join_milestone_reached(server, job)
+    return bool(_threshold_breached_worker_ids(server, job))
+
+
 def _next_threshold_candidate_id(server, job: MasterJobState) -> int | None:
     initialized_ids = _initialized_worker_ids(job)
     for worker_id in getattr(server, "threshold_join_worker_ids", []):
@@ -644,7 +682,7 @@ def _idle_registered_threshold_worker_ids(server, job: MasterJobState) -> list[i
 def _refresh_activation_wait_state(server, job: MasterJobState) -> None:
     next_candidate = _next_threshold_candidate_id(server, job)
     job.activation_waiting_for_worker = bool(
-        _threshold_breached_worker_ids(server, job)
+        _activation_triggered(server, job)
         and next_candidate is not None
         and not _idle_registered_threshold_worker_ids(server, job)
     )
@@ -829,13 +867,18 @@ def _run_rebalance(server, job_id: str, routing_epoch: int) -> None:
         return
 
     try:
+        rebalance_started = time.time()
         with job.lock:
+            triggered_total_vectors = int(job.total_vectors_ingested)
             existing_ids, target_worker_ids, centroids, centroid_to_worker = _prepare_rebalance_plan(job)
             target_shards = [shard for shard in job.shards if shard.worker.worker_id in set(target_worker_ids)]
             target_shards.sort(key=lambda shard: shard.worker.worker_id)
+            new_worker_ids = sorted(job.pending_new_workers)
 
+        drain_started = time.time()
         for shard in target_shards:
             _wait_for_worker_drain(server, shard, job.job_id, server.rebalance_timeout)
+        drain_elapsed = time.time() - drain_started
 
         workers_payload = [
             {
@@ -869,10 +912,17 @@ def _run_rebalance(server, job_id: str, routing_epoch: int) -> None:
                 )
             )
 
+        prepare_started = time.time()
+        prepare_results: dict[int, dict] = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(phase_payloads)) as executor:
-            futures = [executor.submit(_send_rebalance_phase, server, shard, payload, server.rebalance_timeout) for shard, payload in phase_payloads]
-            for future in concurrent.futures.as_completed(futures):
-                future.result()
+            future_map = {
+                executor.submit(_send_rebalance_phase, server, shard, payload, server.rebalance_timeout): shard.worker.worker_id
+                for shard, payload in phase_payloads
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                worker_id = future_map[future]
+                prepare_results[worker_id] = future.result()
+        prepare_elapsed = time.time() - prepare_started
 
         migrate_payloads = [
             (
@@ -886,10 +936,17 @@ def _run_rebalance(server, job_id: str, routing_epoch: int) -> None:
             )
             for shard in target_shards
         ]
+        migrate_started = time.time()
+        migrate_results: dict[int, dict] = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(migrate_payloads)) as executor:
-            futures = [executor.submit(_send_rebalance_phase, server, shard, payload, server.rebalance_timeout) for shard, payload in migrate_payloads]
-            for future in concurrent.futures.as_completed(futures):
-                future.result()
+            future_map = {
+                executor.submit(_send_rebalance_phase, server, shard, payload, server.rebalance_timeout): shard.worker.worker_id
+                for shard, payload in migrate_payloads
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                worker_id = future_map[future]
+                migrate_results[worker_id] = future.result()
+        migrate_elapsed = time.time() - migrate_started
 
         rebuild_payloads = [
             (
@@ -903,6 +960,7 @@ def _run_rebalance(server, job_id: str, routing_epoch: int) -> None:
             )
             for shard in target_shards
         ]
+        rebuild_started = time.time()
         rebuild_results: dict[int, dict] = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(rebuild_payloads)) as executor:
             future_map = {
@@ -912,6 +970,37 @@ def _run_rebalance(server, job_id: str, routing_epoch: int) -> None:
             for future in concurrent.futures.as_completed(future_map):
                 worker_id = future_map[future]
                 rebuild_results[worker_id] = future.result()
+        rebuild_elapsed = time.time() - rebuild_started
+        total_elapsed = time.time() - rebalance_started
+
+        rebalance_record = {
+            "routing_epoch": int(routing_epoch),
+            "triggered_total_vectors": triggered_total_vectors,
+            "existing_worker_ids": list(existing_ids),
+            "new_worker_ids": list(new_worker_ids),
+            "target_worker_ids": list(target_worker_ids),
+            "drain_time_s": round(drain_elapsed, 6),
+            "prepare_phase_s": round(prepare_elapsed, 6),
+            "migrate_phase_s": round(migrate_elapsed, 6),
+            "rebuild_phase_s": round(rebuild_elapsed, 6),
+            "rebalance_total_s": round(total_elapsed, 6),
+            "prepare_worker_phase_s": {
+                str(worker_id): float(result.get("phase_time_s", 0.0))
+                for worker_id, result in sorted(prepare_results.items())
+            },
+            "migrate_worker_phase_s": {
+                str(worker_id): float(result.get("phase_time_s", 0.0))
+                for worker_id, result in sorted(migrate_results.items())
+            },
+            "rebuild_worker_phase_s": {
+                str(worker_id): float(result.get("phase_time_s", 0.0))
+                for worker_id, result in sorted(rebuild_results.items())
+            },
+            "worker_rebalance_total_s": {
+                str(worker_id): float(result.get("rebalance_total_time_s", 0.0))
+                for worker_id, result in sorted(rebuild_results.items())
+            },
+        }
 
         with job.lock:
             job.worker_centroids = {
@@ -926,13 +1015,28 @@ def _run_rebalance(server, job_id: str, routing_epoch: int) -> None:
                 job.pending_new_workers.discard(worker_id)
             job.routing_mode = "centroid"
             job.rebalance_thread = None
+            job.rebalance_history.append(rebalance_record)
             _refresh_activation_wait_state(server, job)
             _maybe_activate_threshold_worker(server, job)
+
+        print(
+            f"[rebalance] epoch={routing_epoch} total_vectors={triggered_total_vectors} "
+            f"workers={target_worker_ids} drain={drain_elapsed:.3f}s "
+            f"prepare={prepare_elapsed:.3f}s migrate={migrate_elapsed:.3f}s "
+            f"rebuild={rebuild_elapsed:.3f}s total={total_elapsed:.3f}s"
+        )
 
     except Exception as ex:
         with job.lock:
             job.error = str(ex)
             job.rebalance_thread = None
+            job.rebalance_history.append(
+                {
+                    "routing_epoch": int(routing_epoch),
+                    "triggered_total_vectors": int(job.total_vectors_ingested),
+                    "error": str(ex),
+                }
+            )
 
 
 def _maybe_start_rebalance(server, job: MasterJobState) -> bool:
@@ -986,6 +1090,104 @@ def _write_centers_file(path: Path, centroids_by_worker: dict[int, np.ndarray], 
         f.write(np.ascontiguousarray(matrix, dtype=np.float32).tobytes())
 
 
+def _wait_until_job_stable_for_snapshot(server, job: MasterJobState) -> None:
+    while True:
+        with job.lock:
+            if job.error is not None:
+                raise RuntimeError(f"job error: {job.error}")
+            if job.finalized:
+                return
+            if job.routing_mode == "bootstrap" and job.bootstrap_batches:
+                _bootstrap_if_ready(server, job, force=True)
+            _maybe_activate_threshold_worker(server, job)
+            if job.pending_new_workers and job.routing_mode != "rebalancing":
+                _maybe_start_rebalance(server, job)
+            rebalance_thread = job.rebalance_thread
+
+        if rebalance_thread is None:
+            return
+        rebalance_thread.join()
+
+
+def _checkpoint_job(server, job: MasterJobState, checkpoint_id: str) -> dict:
+    _wait_until_job_stable_for_snapshot(server, job)
+
+    checkpoint_root = Path(job.output_dir) / "checkpoints" / checkpoint_id
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
+
+    with job.lock:
+        active_shards = sorted(_active_shards(job), key=lambda item: item.worker.worker_id)
+        checkpoint_timeout = getattr(server, "checkpoint_timeout", getattr(server, "finalize_timeout", 600))
+        retries = server.retries
+        shard_results = []
+
+        for shard in active_shards:
+            req = {
+                "job_id": job.job_id,
+                "shard_id": shard.shard_id,
+                "checkpoint_dir": str(checkpoint_root / f"index_shard{shard.worker.worker_id}"),
+            }
+            url = f"{shard.worker.base_url}/checkpoint"
+            try:
+                resp = _post_with_retry(
+                    url,
+                    lambda u=url, p=req: _http_json_post(u, p, checkpoint_timeout),
+                    retries,
+                    f"checkpoint shard {shard.shard_id}",
+                )
+                if not resp.get("ok", False):
+                    raise RuntimeError(f"worker checkpoint failed shard {shard.shard_id}: {resp}")
+            except Exception as ex:
+                raise RuntimeError(f"worker checkpoint failed shard {shard.shard_id}: {ex}") from ex
+
+            centroid = np.asarray(resp.get("centroid", np.zeros(job.dim, dtype=np.float32).tolist()), dtype=np.float32)
+            job.worker_centroids[shard.worker.worker_id] = centroid
+            job.worker_counts[shard.worker.worker_id] = int(resp.get("active_vectors", resp.get("vectors_ingested", 0)))
+            shard_results.append(
+                {
+                    "shard_id": shard.shard_id,
+                    "worker_id": shard.worker.worker_id,
+                    "worker": f"{shard.worker.host}:{shard.worker.port}",
+                    "active_vectors": resp.get("active_vectors", 0),
+                    "checkpoint_dir": resp.get("checkpoint_dir", ""),
+                    "checkpoint_time_s": resp.get("checkpoint_time_s", 0.0),
+                    "add_time_s": resp.get("add_time_s", 0.0),
+                    "elapsed_s": resp.get("elapsed_s", 0.0),
+                    "rebalance_prepare_time_s": resp.get("rebalance_prepare_time_s", 0.0),
+                    "rebalance_migrate_time_s": resp.get("rebalance_migrate_time_s", 0.0),
+                    "rebalance_rebuild_time_s": resp.get("rebalance_rebuild_time_s", 0.0),
+                    "rebalance_total_time_s": resp.get("rebalance_total_time_s", 0.0),
+                }
+            )
+            print(
+                f"[checkpoint] shard={shard.shard_id} dir={resp.get('checkpoint_dir')} "
+                f"active={resp.get('active_vectors', 0)} "
+                f"worker_checkpoint={resp.get('checkpoint_time_s', 0):.3f}s"
+            )
+
+        active_centroids = {
+            shard.worker.worker_id: job.worker_centroids[shard.worker.worker_id]
+            for shard in active_shards
+            if shard.worker.worker_id in job.worker_centroids
+        }
+        centers_path = checkpoint_root / "centers"
+        _write_centers_file(centers_path, active_centroids, job.dim)
+
+        record = {
+            "checkpoint_id": checkpoint_id,
+            "checkpoint_dir": str(checkpoint_root),
+            "centers_file": str(centers_path),
+            "total_vectors_ingested": int(job.total_vectors_ingested),
+            "routing_epoch": int(job.routing_epoch),
+            "active_workers": [shard.worker.worker_id for shard in active_shards],
+            "shards": shard_results,
+        }
+        job.latest_checkpoint_dir = str(checkpoint_root)
+        job.latest_checkpoint_centers_file = str(centers_path)
+        job.checkpoint_history.append(record)
+        return record
+
+
 class MasterHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         super().log_message(fmt, *args)
@@ -1003,6 +1205,8 @@ class MasterHandler(BaseHTTPRequestHandler):
             return self._handle_init()
         if self.path == "/add_batch":
             return self._handle_add_batch()
+        if self.path == "/checkpoint":
+            return self._handle_checkpoint()
         if self.path == "/finalize":
             return self._handle_finalize()
         if self.path == "/shutdown":
@@ -1184,6 +1388,7 @@ class MasterHandler(BaseHTTPRequestHandler):
                 )
                 job.bootstrap_vector_count += num
                 try:
+                    job.total_vectors_ingested += num
                     bootstrap_ready = _bootstrap_if_ready(self.server, job, force=False)
                     if bootstrap_ready:
                         _maybe_activate_threshold_worker(self.server, job)
@@ -1227,6 +1432,7 @@ class MasterHandler(BaseHTTPRequestHandler):
 
             try:
                 shards_touched = _forward_routed_batch(self.server, job, vectors, global_ids, normalized)
+                job.total_vectors_ingested += num
                 _maybe_activate_threshold_worker(self.server, job)
             except Exception as ex:
                 job.error = str(ex)
@@ -1246,6 +1452,35 @@ class MasterHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _handle_checkpoint(self):
+        req = _read_json(self)
+        try:
+            job_id = str(req["job_id"])
+            checkpoint_id = str(req.get("checkpoint_id") or "")
+        except Exception as ex:
+            _json_response(self, 400, {"ok": False, "error": f"invalid checkpoint payload: {ex}"})
+            return
+
+        with STATE_LOCK:
+            job = STATE.get(job_id)
+
+        if job is None:
+            _json_response(self, 404, {"ok": False, "error": "job not found"})
+            return
+
+        if not checkpoint_id:
+            checkpoint_id = str(int(job.total_vectors_ingested))
+
+        try:
+            record = _checkpoint_job(self.server, job, checkpoint_id)
+        except Exception as ex:
+            with job.lock:
+                job.error = str(ex)
+            _json_response(self, 502, {"ok": False, "error": str(ex)})
+            return
+
+        _json_response(self, 200, {"ok": True, "job_id": job_id, **record})
+
     def _handle_finalize(self):
         req = _read_json(self)
         try:
@@ -1261,34 +1496,13 @@ class MasterHandler(BaseHTTPRequestHandler):
             _json_response(self, 404, {"ok": False, "error": "job not found"})
             return
 
-        while True:
+        try:
+            _wait_until_job_stable_for_snapshot(self.server, job)
+        except Exception as ex:
             with job.lock:
-                if job.error is not None:
-                    _json_response(self, 500, {"ok": False, "error": f"job error: {job.error}"})
-                    return
-                if job.finalized:
-                    _json_response(self, 200, {"ok": True, "already_finalized": True})
-                    return
-                if job.routing_mode == "bootstrap" and job.bootstrap_batches:
-                    try:
-                        _bootstrap_if_ready(self.server, job, force=True)
-                    except Exception as ex:
-                        job.error = str(ex)
-                        _json_response(self, 502, {"ok": False, "error": str(ex)})
-                        return
-                try:
-                    _maybe_activate_threshold_worker(self.server, job)
-                except Exception as ex:
-                    job.error = str(ex)
-                    _json_response(self, 502, {"ok": False, "error": str(ex)})
-                    return
-                if job.pending_new_workers and job.routing_mode != "rebalancing":
-                    _maybe_start_rebalance(self.server, job)
-                rebalance_thread = job.rebalance_thread
-
-            if rebalance_thread is None:
-                break
-            rebalance_thread.join()
+                job.error = str(ex)
+            _json_response(self, 502, {"ok": False, "error": str(ex)})
+            return
 
         with job.lock:
             if job.error is not None:
@@ -1333,6 +1547,11 @@ class MasterHandler(BaseHTTPRequestHandler):
                         "add_time_s": resp.get("add_time_s", 0.0),
                         "finalize_time_s": resp.get("finalize_time_s", 0.0),
                         "elapsed_s": resp.get("elapsed_s", 0.0),
+                        "checkpoint_time_s": resp.get("checkpoint_time_s", 0.0),
+                        "rebalance_prepare_time_s": resp.get("rebalance_prepare_time_s", 0.0),
+                        "rebalance_migrate_time_s": resp.get("rebalance_migrate_time_s", 0.0),
+                        "rebalance_rebuild_time_s": resp.get("rebalance_rebuild_time_s", 0.0),
+                        "rebalance_total_time_s": resp.get("rebalance_total_time_s", 0.0),
                     }
                 )
                 print(
@@ -1378,6 +1597,8 @@ class MasterHandler(BaseHTTPRequestHandler):
             idle_registered_worker_ids = _idle_registered_threshold_worker_ids(self.server, job)
             next_activation_candidate = _next_threshold_candidate_id(self.server, job)
             threshold_breached = bool(_threshold_breached_worker_ids(self.server, job))
+            activation_triggered = bool(_activation_triggered(self.server, job))
+            next_join_milestone = _next_join_milestone(self.server, job)
             shard_info = []
             for shard in sorted(job.shards, key=lambda item: item.worker.worker_id):
                 shard_info.append(
@@ -1404,11 +1625,15 @@ class MasterHandler(BaseHTTPRequestHandler):
                     "initialized_shards": len(job.shards),
                     "routing_mode": job.routing_mode,
                     "routing_epoch": job.routing_epoch,
+                    "total_vectors_ingested": int(job.total_vectors_ingested),
                     "pending_new_workers": sorted(job.pending_new_workers),
                     "bootstrap_vector_count": job.bootstrap_vector_count,
                     "reservoir_seen": job.reservoir_seen,
                     "activation_threshold_vectors": int(getattr(self.server, "activation_threshold_vectors", 0)),
+                    "join_at_total_vectors": [int(value) for value in getattr(self.server, "join_at_total_vectors", [])],
+                    "next_join_milestone": next_join_milestone,
                     "threshold_breached": threshold_breached,
+                    "activation_triggered": activation_triggered,
                     "activation_waiting_for_worker": bool(job.activation_waiting_for_worker),
                     "next_activation_candidate": next_activation_candidate,
                     "active_workers": active_worker_ids,
@@ -1416,6 +1641,13 @@ class MasterHandler(BaseHTTPRequestHandler):
                     "finalized": job.finalized,
                     "error": job.error,
                     "centers_file": job.centers_file,
+                    "latest_checkpoint_dir": job.latest_checkpoint_dir,
+                    "latest_checkpoint_centers_file": job.latest_checkpoint_centers_file,
+                    "checkpoint_history_size": len(job.checkpoint_history),
+                    "last_checkpoint": job.checkpoint_history[-1] if job.checkpoint_history else None,
+                    "rebalance_history_size": len(job.rebalance_history),
+                    "last_rebalance": job.rebalance_history[-1] if job.rebalance_history else None,
+                    "rebalance_history": list(job.rebalance_history),
                     "shards": shard_info,
                 },
             )
@@ -1448,8 +1680,14 @@ def main():
         default=0,
         help="Activate one idle threshold worker when any active worker reaches this many active vectors.",
     )
+    parser.add_argument(
+        "--join_at_total_vectors",
+        default="",
+        help="Comma-separated total-ingested milestones for activating threshold workers one at a time.",
+    )
     parser.add_argument("--request_timeout", type=int, default=60)
     parser.add_argument("--finalize_timeout", type=int, default=600)
+    parser.add_argument("--checkpoint_timeout", type=int, default=600)
     parser.add_argument("--rebalance_timeout", type=int, default=1800)
     parser.add_argument("--retries", type=int, default=5)
     parser.add_argument("--debug", action="store_true")
@@ -1471,6 +1709,7 @@ def main():
     server.next_worker_id = 0
     server.request_timeout = args.request_timeout
     server.finalize_timeout = args.finalize_timeout
+    server.checkpoint_timeout = args.checkpoint_timeout
     server.rebalance_timeout = args.rebalance_timeout
     server.retries = args.retries
     server.debug = args.debug
@@ -1480,6 +1719,20 @@ def main():
     server.rebalance_enabled = not args.disable_rebalance
     server.exit_after_finalize = not args.no_exit_after_finalize
     server.activation_threshold_vectors = max(0, int(args.activation_threshold_vectors))
+    join_at_total_vectors = []
+    if args.join_at_total_vectors:
+        for raw_value in str(args.join_at_total_vectors).split(","):
+            token = raw_value.strip()
+            if not token:
+                continue
+            try:
+                parsed = int(token)
+            except ValueError as ex:
+                raise ValueError(f"invalid join_at_total_vectors entry: {token!r}") from ex
+            if parsed <= 0:
+                raise ValueError("join_at_total_vectors entries must be positive integers")
+            join_at_total_vectors.append(parsed)
+    server.join_at_total_vectors = sorted(join_at_total_vectors)
 
     initial_workers = _resolve_workers(args.workers_file, args.workers, "initial workers")
     threshold_workers = _resolve_workers(
@@ -1503,10 +1756,12 @@ def main():
         configured = _add_configured_worker(server, worker, registered=False)
         print(f"[worker] threshold worker_id={configured.worker_id} addr={configured.host}:{configured.port}")
 
-    if server.activation_threshold_vectors > 0 and not server.threshold_join_worker_ids:
-        raise ValueError("activation_threshold_vectors requires at least one threshold join worker")
-    if server.activation_threshold_vectors > 0 and not server.rebalance_enabled:
-        raise ValueError("activation_threshold_vectors requires rebalance to be enabled")
+    if server.activation_threshold_vectors > 0 and server.join_at_total_vectors:
+        raise ValueError("activation_threshold_vectors and join_at_total_vectors are mutually exclusive")
+    if (server.activation_threshold_vectors > 0 or server.join_at_total_vectors) and not server.threshold_join_worker_ids:
+        raise ValueError("worker activation requires at least one threshold join worker")
+    if (server.activation_threshold_vectors > 0 or server.join_at_total_vectors) and not server.rebalance_enabled:
+        raise ValueError("worker activation requires rebalance to be enabled")
 
     configured_workers = _snapshot_workers(server)
     registered_workers = _snapshot_registered_workers(server)
@@ -1517,6 +1772,8 @@ def main():
         f"rebalance_enabled={server.rebalance_enabled} "
         f"activation_threshold_vectors={server.activation_threshold_vectors}"
     )
+    if server.join_at_total_vectors:
+        print(f"  join_at_total_vectors={server.join_at_total_vectors}")
     print(f"  initial_worker_ids={server.initial_worker_ids}")
     print(f"  threshold_join_worker_ids={server.threshold_join_worker_ids}")
     print(f"  registered_workers={len(registered_workers)}")
