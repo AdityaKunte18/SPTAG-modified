@@ -134,6 +134,35 @@ def _default_advertise_host(bind_host: str) -> str:
     return bind_host
 
 
+def _memory_snapshot() -> dict:
+    stats = {
+        "rss_bytes": 0,
+        "rss_mb": 0.0,
+        "hwm_bytes": 0,
+        "hwm_mb": 0.0,
+        "vmsize_bytes": 0,
+        "vmsize_mb": 0.0,
+    }
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    kb = int(line.split()[1])
+                    stats["rss_bytes"] = kb * 1024
+                    stats["rss_mb"] = round((kb * 1024) / (1024.0 * 1024.0), 3)
+                elif line.startswith("VmHWM:"):
+                    kb = int(line.split()[1])
+                    stats["hwm_bytes"] = kb * 1024
+                    stats["hwm_mb"] = round((kb * 1024) / (1024.0 * 1024.0), 3)
+                elif line.startswith("VmSize:"):
+                    kb = int(line.split()[1])
+                    stats["vmsize_bytes"] = kb * 1024
+                    stats["vmsize_mb"] = round((kb * 1024) / (1024.0 * 1024.0), 3)
+    except Exception:
+        pass
+    return stats
+
+
 def _register_with_master(
     master_url: str,
     advertise_host: str,
@@ -178,10 +207,72 @@ def _distance_matrix(vectors: np.ndarray, centroids: np.ndarray, metric: str) ->
     return np.sum(diff * diff, axis=2)
 
 
-def _make_index(algo: str, dist: str, dim: int, threads: int):
-    index = SPTAG.AnnIndex(algo, "Float", dim)
+def _normalize_value_type(value_type: str) -> str:
+    value = str(value_type or "Float").strip()
+    aliases = {
+        "FLOAT": "Float",
+        "UINT8": "UInt8",
+    }
+    normalized = aliases.get(value.upper())
+    if normalized is None:
+        raise ValueError(f"unsupported value_type: {value_type}")
+    return normalized
+
+
+def _optional_positive_int(value, name: str) -> int | None:
+    if value is None or value == "":
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"{name} must be > 0")
+    return parsed
+
+
+def _optional_positive_float(value, name: str) -> float | None:
+    if value is None or value == "":
+        return None
+    parsed = float(value)
+    if parsed <= 0:
+        raise ValueError(f"{name} must be > 0")
+    return parsed
+
+
+def _build_params_payload(cef: int | None, max_check_for_refine_graph: int | None, graph_neighborhood_scale: float | None) -> dict:
+    return {
+        "cef": cef,
+        "max_check_for_refine_graph": max_check_for_refine_graph,
+        "graph_neighborhood_scale": graph_neighborhood_scale,
+    }
+
+
+def _vectors_for_index(value_type: str, vectors: np.ndarray) -> np.ndarray:
+    normalized = _normalize_value_type(value_type)
+    if normalized == "UInt8":
+        clipped = np.clip(np.rint(vectors), 0, 255)
+        return np.ascontiguousarray(clipped.astype(np.uint8, copy=False))
+    return np.ascontiguousarray(vectors.astype(np.float32, copy=False))
+
+
+def _make_index(
+    algo: str,
+    dist: str,
+    dim: int,
+    threads: int,
+    value_type: str,
+    cef: int | None = None,
+    max_check_for_refine_graph: int | None = None,
+    graph_neighborhood_scale: float | None = None,
+):
+    normalized_value_type = _normalize_value_type(value_type)
+    index = SPTAG.AnnIndex(algo, normalized_value_type, dim)
     index.SetBuildParam("DistCalcMethod", dist, "Index")
     index.SetBuildParam("NumberOfThreads", str(threads), "Index")
+    if cef is not None:
+        index.SetBuildParam("CEF", str(int(cef)), "Index")
+    if max_check_for_refine_graph is not None:
+        index.SetBuildParam("MaxCheckForRefineGraph", str(int(max_check_for_refine_graph)), "Index")
+    if graph_neighborhood_scale is not None:
+        index.SetBuildParam("GraphNeighborhoodScale", str(float(graph_neighborhood_scale)), "Index")
     return index
 
 
@@ -309,7 +400,11 @@ class JobState:
     algo: str
     dim: int
     dist: str
+    value_type: str
     threads: int
+    cef: int | None
+    max_check_for_refine_graph: int | None
+    graph_neighborhood_scale: float | None
     save_dir: str
     shard_id: int
     with_meta_index: bool
@@ -327,13 +422,27 @@ class JobState:
     add_time_s: float = 0.0
     finalize_time_s: float = 0.0
     checkpoint_time_s: float = 0.0
+    ingest_add_time_s: float = 0.0
+    ingest_add_vectors: int = 0
+    migrate_receive_add_time_s: float = 0.0
+    migrate_receive_add_vectors: int = 0
+    migrate_delete_time_s: float = 0.0
+    migrate_delete_vectors: int = 0
+    rebuild_replay_add_time_s: float = 0.0
+    rebuild_replay_vectors: int = 0
+    memory_log_interval_vectors: int = 0
+    next_memory_log_vectors: int = 0
 
-    q: "queue.Queue[tuple[int,np.ndarray,int,bool,bytes]]" | None = None
+    q: "queue.Queue[tuple[int,np.ndarray,int,bool,bytes,float]]" | None = None
     stop_event: threading.Event | None = None
     consumer: threading.Thread | None = None
 
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
+    applied_cv: threading.Condition | None = field(default=None, repr=False, compare=False)
     error: str | None = None
+    last_completed_batch_id: int = -1
+    last_completed_batch_metrics: dict = field(default_factory=dict, repr=False)
+    batch_insert_history: list[dict] = field(default_factory=list, repr=False)
 
     last_routing_epoch: int = 0
     rebalance_plan: RebalancePlan | None = None
@@ -343,7 +452,13 @@ class JobState:
     last_rebalance_migrate_time_s: float = 0.0
     last_rebalance_rebuild_time_s: float = 0.0
     last_rebalance_total_time_s: float = 0.0
+    last_rebalance_migrate_rpc_roundtrip_s: float = 0.0
+    last_rebalance_migrate_remote_apply_time_s: float = 0.0
+    last_rebalance_migrate_comm_time_s: float = 0.0
+    last_rebalance_migrate_batches_sent: int = 0
+    last_rebalance_migrate_vectors_sent: int = 0
     rebalance_history: list[dict] = field(default_factory=list, repr=False)
+    memory_history: list[dict] = field(default_factory=list, repr=False)
 
 
 STATE: dict[str, JobState] = {}
@@ -355,7 +470,71 @@ def _get_state(key: str) -> JobState | None:
         return STATE.get(key)
 
 
-def _apply_vectors_to_index(st: JobState, vectors: np.ndarray, global_ids: np.ndarray, normalized: bool) -> float:
+def _vector_op_summary(st: JobState) -> dict:
+    total_add_vectors = int(st.ingest_add_vectors + st.migrate_receive_add_vectors + st.rebuild_replay_vectors)
+    return {
+        "total_add_time_s": st.add_time_s,
+        "total_add_vectors": total_add_vectors,
+        "total_delete_time_s": st.migrate_delete_time_s,
+        "total_delete_vectors": st.migrate_delete_vectors,
+        "ingest_add_time_s": st.ingest_add_time_s,
+        "ingest_add_vectors": st.ingest_add_vectors,
+        "migrate_receive_add_time_s": st.migrate_receive_add_time_s,
+        "migrate_receive_add_vectors": st.migrate_receive_add_vectors,
+        "migrate_delete_time_s": st.migrate_delete_time_s,
+        "migrate_delete_vectors": st.migrate_delete_vectors,
+        "rebuild_replay_add_time_s": st.rebuild_replay_add_time_s,
+        "rebuild_replay_vectors": st.rebuild_replay_vectors,
+    }
+
+
+def _batch_insert_summary(st: JobState) -> dict:
+    return {
+        "count": len(st.batch_insert_history),
+        "total_apply_time_s": round(sum(float(item.get("apply_time_s", 0.0)) for item in st.batch_insert_history), 6),
+        "total_queue_wait_time_s": round(
+            sum(float(item.get("queue_wait_time_s", 0.0)) for item in st.batch_insert_history), 6
+        ),
+    }
+
+
+def _maybe_log_memory(st: JobState, reason: str, *, force: bool = False) -> None:
+    interval = int(getattr(st, "memory_log_interval_vectors", 0))
+    active = int(st.local_store.active_count)
+    if not force:
+        if interval <= 0:
+            return
+        if active < int(getattr(st, "next_memory_log_vectors", 0)):
+            return
+    snapshot = _memory_snapshot()
+    event = {
+        "reason": str(reason),
+        "active_vectors": active,
+        "elapsed_s": round(max(0.0, time.time() - st.init_time_s), 6),
+        **snapshot,
+    }
+    st.memory_history.append(event)
+    print(
+        f"[memory] shard={st.shard_id} reason={reason} active={active} "
+        f"rss={snapshot.get('rss_mb', 0.0):.3f}MB "
+        f"hwm={snapshot.get('hwm_mb', 0.0):.3f}MB "
+        f"vmsize={snapshot.get('vmsize_mb', 0.0):.3f}MB"
+    )
+    if interval > 0:
+        next_target = max(interval, int(getattr(st, "next_memory_log_vectors", interval)))
+        while next_target <= active:
+            next_target += interval
+        st.next_memory_log_vectors = next_target
+
+
+def _apply_vectors_to_index(
+    st: JobState,
+    vectors: np.ndarray,
+    global_ids: np.ndarray,
+    normalized: bool,
+    *,
+    source: str,
+) -> float:
     vectors = np.ascontiguousarray(vectors, dtype=np.float32)
     global_ids = np.ascontiguousarray(global_ids, dtype=np.int64)
     if vectors.shape[0] != global_ids.shape[0]:
@@ -364,31 +543,46 @@ def _apply_vectors_to_index(st: JobState, vectors: np.ndarray, global_ids: np.nd
         return 0.0
 
     metadata = _meta_block_from_ids(global_ids)
+    index_vectors = _vectors_for_index(st.value_type, vectors)
     t_add_start = time.time()
     if (not st.first_batch_done) and st.algo.upper() == "SPANN":
-        ok = st.index.BuildWithMetaData(vectors.tobytes(), metadata, vectors.shape[0], st.with_meta_index, normalized)
+        ok = st.index.BuildWithMetaData(
+            index_vectors.tobytes(), metadata, vectors.shape[0], st.with_meta_index, normalized
+        )
     else:
-        ok = st.index.AddWithMetaData(vectors.tobytes(), metadata, vectors.shape[0], st.with_meta_index, normalized)
+        ok = st.index.AddWithMetaData(index_vectors.tobytes(), metadata, vectors.shape[0], st.with_meta_index, normalized)
     add_elapsed = time.time() - t_add_start
     if not ok:
         raise RuntimeError("SPTAG add/build with metadata failed")
     st.first_batch_done = True
     st.add_time_s += add_elapsed
+    if source == "ingest":
+        st.ingest_add_time_s += add_elapsed
+        st.ingest_add_vectors += int(vectors.shape[0])
+    elif source == "migrate_receive":
+        st.migrate_receive_add_time_s += add_elapsed
+        st.migrate_receive_add_vectors += int(vectors.shape[0])
+    elif source == "rebuild":
+        st.rebuild_replay_add_time_s += add_elapsed
+        st.rebuild_replay_vectors += int(vectors.shape[0])
+    else:
+        raise ValueError(f"unknown add source: {source}")
     st.vectors_ingested = st.local_store.active_count
     return add_elapsed
 
 
-def _delete_vectors_from_index(st: JobState, vectors: np.ndarray, global_ids: np.ndarray) -> None:
+def _delete_vectors_from_index(st: JobState, vectors: np.ndarray, global_ids: np.ndarray) -> float:
     vectors = np.ascontiguousarray(vectors, dtype=np.float32)
     global_ids = np.ascontiguousarray(global_ids, dtype=np.int64)
     if vectors.shape[0] != global_ids.shape[0]:
         raise ValueError("vector/id count mismatch on delete")
     if vectors.size == 0:
-        return
+        return 0.0
 
     metadata = _meta_block_from_ids(global_ids)
     delete_ok = False
     delete_error: Exception | None = None
+    t0 = time.time()
 
     try:
         delete_ok = bool(st.index.DeleteByMetaData(metadata))
@@ -397,7 +591,8 @@ def _delete_vectors_from_index(st: JobState, vectors: np.ndarray, global_ids: np
 
     if not delete_ok:
         try:
-            delete_ok = bool(st.index.Delete(vectors.tobytes(), vectors.shape[0]))
+            delete_vectors = _vectors_for_index(st.value_type, vectors)
+            delete_ok = bool(st.index.Delete(delete_vectors.tobytes(), vectors.shape[0]))
         except Exception as ex:
             delete_error = ex
 
@@ -405,10 +600,23 @@ def _delete_vectors_from_index(st: JobState, vectors: np.ndarray, global_ids: np
         if delete_error is not None:
             raise RuntimeError(f"SPTAG delete failed: {delete_error}")
         raise RuntimeError("SPTAG delete failed")
+    elapsed = time.time() - t0
+    st.migrate_delete_time_s += elapsed
+    st.migrate_delete_vectors += int(vectors.shape[0])
+    return elapsed
 
 
 def _rebuild_index_from_store(st: JobState, batch_size: int) -> tuple[int, np.ndarray]:
-    new_index = _make_index(st.algo, st.dist, st.dim, st.threads)
+    new_index = _make_index(
+        st.algo,
+        st.dist,
+        st.dim,
+        st.threads,
+        st.value_type,
+        st.cef,
+        st.max_check_for_refine_graph,
+        st.graph_neighborhood_scale,
+    )
     first_batch_done = False
     total = 0
     add_time_s = 0.0
@@ -416,16 +624,23 @@ def _rebuild_index_from_store(st: JobState, batch_size: int) -> tuple[int, np.nd
 
     for _, vectors, global_ids in st.local_store.iter_active_chunks(batch_size=batch_size):
         metadata = _meta_block_from_ids(global_ids)
+        index_vectors = _vectors_for_index(st.value_type, vectors)
         t0 = time.time()
         if (not first_batch_done) and st.algo.upper() == "SPANN":
-            ok = new_index.BuildWithMetaData(vectors.tobytes(), metadata, vectors.shape[0], st.with_meta_index, normalized)
+            ok = new_index.BuildWithMetaData(
+                index_vectors.tobytes(), metadata, vectors.shape[0], st.with_meta_index, normalized
+            )
         else:
-            ok = new_index.AddWithMetaData(vectors.tobytes(), metadata, vectors.shape[0], st.with_meta_index, normalized)
+            ok = new_index.AddWithMetaData(
+                index_vectors.tobytes(), metadata, vectors.shape[0], st.with_meta_index, normalized
+            )
         elapsed = time.time() - t0
         if not ok:
             raise RuntimeError("SPTAG rebuild failed while replaying active vectors")
         add_time_s += elapsed
+        st.rebuild_replay_add_time_s += elapsed
         total += int(vectors.shape[0])
+        st.rebuild_replay_vectors += int(vectors.shape[0])
         first_batch_done = True
 
     if total > 0:
@@ -436,7 +651,7 @@ def _rebuild_index_from_store(st: JobState, batch_size: int) -> tuple[int, np.nd
     st.index = new_index
     st.first_batch_done = first_batch_done
     st.vectors_ingested = st.local_store.active_count
-    st.add_time_s = add_time_s
+    st.add_time_s = st.ingest_add_time_s + st.migrate_receive_add_time_s + st.rebuild_replay_add_time_s
     return st.local_store.active_count, st.local_store.centroid()
 
 
@@ -473,7 +688,7 @@ def _consumer_loop(key: str) -> None:
             st.q.task_done()
             return
 
-        batch_id, global_ids, dim, normalized, vec_bytes = item
+        batch_id, global_ids, dim, normalized, vec_bytes, enqueue_time = item
 
         st = _get_state(key)
         if st is None:
@@ -485,12 +700,40 @@ def _consumer_loop(key: str) -> None:
                 if st.finalized or st.error is not None:
                     pass
                 else:
+                    apply_started_at = time.time()
+                    queue_wait_time_s = max(0.0, apply_started_at - float(enqueue_time))
                     st.local_store.append(vectors, global_ids)
-                    _apply_vectors_to_index(st, vectors, global_ids, normalized)
+                    add_elapsed = _apply_vectors_to_index(st, vectors, global_ids, normalized, source="ingest")
                     st.last_batch_id = batch_id
+                    st.last_completed_batch_id = batch_id
+                    st.last_completed_batch_metrics = {
+                        "apply_time_s": add_elapsed,
+                        "queue_wait_time_s": queue_wait_time_s,
+                    }
+                    st.batch_insert_history.append(
+                        {
+                            "batch_id": int(batch_id),
+                            "vectors": int(global_ids.shape[0]),
+                            "apply_time_s": round(float(add_elapsed), 6),
+                            "queue_wait_time_s": round(float(queue_wait_time_s), 6),
+                            "total_insert_time_s": round(float(queue_wait_time_s + add_elapsed), 6),
+                            "elapsed_s": round(max(0.0, time.time() - st.init_time_s), 6),
+                            "value_type": st.value_type,
+                        }
+                    )
+                    print(
+                        f"[batch_insert] shard={st.shard_id} batch={int(batch_id)} vectors={int(global_ids.shape[0])} "
+                        f"apply={add_elapsed:.6f}s queue_wait={queue_wait_time_s:.6f}s "
+                        f"total={queue_wait_time_s + add_elapsed:.6f}s"
+                    )
+                    _maybe_log_memory(st, "ingest")
+                if st.applied_cv is not None:
+                    st.applied_cv.notify_all()
         except Exception as ex:
             with st.lock:
                 st.error = f"{type(ex).__name__}: {ex}"
+                if st.applied_cv is not None:
+                    st.applied_cv.notify_all()
         finally:
             st.q.task_done()
 
@@ -527,12 +770,20 @@ def _send_migrate_batch(
     meta_raw = json.dumps(meta).encode("utf-8")
     payload = struct.pack("<Q", len(meta_raw)) + meta_raw + vectors.tobytes()
     url = f"{destination_url}/migrate_batch"
-    return _post_with_retry(
+    t0 = time.time()
+    resp = _post_with_retry(
         url,
         lambda p=payload, u=url: _http_binary_post(u, p, st.server_peer_timeout),
         st.server_peer_retries,
         f"migrate batch {source_worker_id}->{destination_url}",
     )
+    rpc_elapsed = time.time() - t0
+    resp = dict(resp)
+    remote_apply_time = float(resp.get("apply_time_s", 0.0))
+    resp["_source_rpc_roundtrip_s"] = rpc_elapsed
+    resp["_destination_apply_time_s"] = remote_apply_time
+    resp["_source_comm_time_s"] = max(0.0, rpc_elapsed - remote_apply_time)
+    return resp
 
 
 class WorkerHandler(BaseHTTPRequestHandler):
@@ -571,6 +822,12 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     "algo": st.algo,
                     "dim": st.dim,
                     "dist": st.dist,
+                    "value_type": st.value_type,
+                    "build_params": _build_params_payload(
+                        st.cef,
+                        st.max_check_for_refine_graph,
+                        st.graph_neighborhood_scale,
+                    ),
                     "vectors_ingested": st.vectors_ingested,
                     "active_vectors": st.local_store.active_count,
                     "store_vectors_total": st.local_store.vector_count,
@@ -581,6 +838,14 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     "elapsed_s": max(0.0, time.time() - st.init_time_s),
                     "add_time_s": st.add_time_s,
                     "finalize_time_s": st.finalize_time_s,
+                    "vector_op_summary": _vector_op_summary(st),
+                    "batch_insert_summary": _batch_insert_summary(st),
+                    "batch_insert_history_size": len(st.batch_insert_history),
+                    "batch_insert_history": list(st.batch_insert_history),
+                    "memory": _memory_snapshot(),
+                    "memory_history_size": len(st.memory_history),
+                    "last_memory": st.memory_history[-1] if st.memory_history else None,
+                    "memory_history": list(st.memory_history),
                     "queued": queued,
                     "queue_max": qmax,
                     "error": st.error,
@@ -589,6 +854,11 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     "rebalance_history_size": len(st.rebalance_history),
                     "last_rebalance": st.rebalance_history[-1] if st.rebalance_history else None,
                     "rebalance_history": list(st.rebalance_history),
+                    "migrate_rpc_roundtrip_s": st.last_rebalance_migrate_rpc_roundtrip_s,
+                    "migrate_remote_apply_time_s": st.last_rebalance_migrate_remote_apply_time_s,
+                    "migrate_comm_time_s": st.last_rebalance_migrate_comm_time_s,
+                    "migrate_batches_sent": st.last_rebalance_migrate_batches_sent,
+                    "migrate_vectors_sent": st.last_rebalance_migrate_vectors_sent,
                 },
             )
 
@@ -610,6 +880,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
         _json_response(self, 404, {"ok": False, "error": "not found"})
 
     def _handle_init(self):
+        request_started = time.time()
         req = _read_json(self)
         try:
             job_id = str(req["job_id"])
@@ -617,7 +888,15 @@ class WorkerHandler(BaseHTTPRequestHandler):
             algo = str(req.get("algo", "BKT"))
             dim = int(req["dim"])
             dist = str(req.get("dist", "L2"))
+            value_type = _normalize_value_type(str(req.get("value_type", "Float")))
             threads = int(req.get("threads", 8))
+            cef = _optional_positive_int(req.get("cef"), "cef")
+            max_check_for_refine_graph = _optional_positive_int(
+                req.get("max_check_for_refine_graph"), "max_check_for_refine_graph"
+            )
+            graph_neighborhood_scale = _optional_positive_float(
+                req.get("graph_neighborhood_scale"), "graph_neighborhood_scale"
+            )
             save_dir = str(req["save_dir"])
             with_meta_index = bool(req.get("with_meta_index", False))
         except Exception as ex:
@@ -632,11 +911,24 @@ class WorkerHandler(BaseHTTPRequestHandler):
         local_store = _create_local_store(save_dir, dim)
         st = JobState(
             job_id=job_id,
-            index=_make_index(algo, dist, dim, threads),
+            index=_make_index(
+                algo,
+                dist,
+                dim,
+                threads,
+                value_type,
+                cef,
+                max_check_for_refine_graph,
+                graph_neighborhood_scale,
+            ),
             algo=algo,
             dim=dim,
             dist=dist,
+            value_type=value_type,
             threads=threads,
+            cef=cef,
+            max_check_for_refine_graph=max_check_for_refine_graph,
+            graph_neighborhood_scale=graph_neighborhood_scale,
             save_dir=save_dir,
             shard_id=shard_id,
             with_meta_index=with_meta_index,
@@ -649,6 +941,9 @@ class WorkerHandler(BaseHTTPRequestHandler):
         st.server_peer_retries = getattr(self.server, "peer_retries", 5)
         st.migrate_batch_size = getattr(self.server, "migrate_batch_size", 2048)
         st.rebuild_batch_size = getattr(self.server, "rebuild_batch_size", 2048)
+        st.memory_log_interval_vectors = int(getattr(self.server, "memory_log_interval_vectors", 0))
+        st.next_memory_log_vectors = int(st.memory_log_interval_vectors) if st.memory_log_interval_vectors > 0 else 0
+        st.applied_cv = threading.Condition(st.lock)
 
         with STATE_LOCK:
             STATE[key] = st
@@ -657,11 +952,23 @@ class WorkerHandler(BaseHTTPRequestHandler):
         st.consumer = t
         t.start()
 
-        _json_response(self, 200, {"ok": True, "job_id": job_id, "shard_id": shard_id, "queue_max": qmax})
+        _json_response(
+            self,
+            200,
+            {
+                "ok": True,
+                "job_id": job_id,
+                "shard_id": shard_id,
+                "queue_max": qmax,
+                "request_handling_time_s": max(0.0, time.time() - request_started),
+            },
+        )
 
     def _handle_add_batch(self):
+        request_started = time.time()
         content_len = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(content_len)
+        body_read_done = time.time()
         if len(raw) < 8:
             _json_response(self, 400, {"ok": False, "error": "payload too small"})
             return
@@ -735,37 +1042,73 @@ class WorkerHandler(BaseHTTPRequestHandler):
                         "batch_id": batch_id,
                         "vectors_ingested": st.vectors_ingested,
                         "last_applied_batch_id": st.last_batch_id,
+                        "applied": True,
+                        "body_read_time_s": max(0.0, body_read_done - request_started),
+                        "post_read_processing_s": max(0.0, time.time() - body_read_done),
+                        "request_handling_time_s": max(0.0, time.time() - request_started),
                     },
                 )
                 return
-            if batch_id != st.next_expected_batch_id:
-                _json_response(
-                    self,
-                    409,
-                    {"ok": False, "error": f"out of order batch_id={batch_id}, expected {st.next_expected_batch_id}"},
-                )
-                return
-            try:
-                st.q.put_nowait((batch_id, global_ids, dim, normalized, vec_bytes))
-            except queue.Full:
-                _json_response(self, 429, {"ok": False, "queue_full": True, "retry_after_ms": 200})
-                return
-            st.next_expected_batch_id += 1
+            accepted_new_batch = False
+            if batch_id < st.next_expected_batch_id:
+                inflight_duplicate = True
+            else:
+                inflight_duplicate = False
+                if st.next_expected_batch_id > st.last_batch_id + 1:
+                    _json_response(self, 429, {"ok": False, "queue_full": True, "retry_after_ms": 200})
+                    return
+                if batch_id != st.next_expected_batch_id:
+                    _json_response(
+                        self,
+                        409,
+                        {"ok": False, "error": f"out of order batch_id={batch_id}, expected {st.next_expected_batch_id}"},
+                    )
+                    return
+                enqueue_time = time.time()
+                try:
+                    st.q.put_nowait((batch_id, global_ids, dim, normalized, vec_bytes, enqueue_time))
+                except queue.Full:
+                    _json_response(self, 429, {"ok": False, "queue_full": True, "retry_after_ms": 200})
+                    return
+                st.next_expected_batch_id += 1
+                accepted_new_batch = True
             queued = st.q.qsize()
             qmax = st.q.maxsize
+            while True:
+                if st.error is not None:
+                    _json_response(self, 500, {"ok": False, "error": f"worker error: {st.error}"})
+                    return
+                if st.finalized:
+                    _json_response(self, 409, {"ok": False, "error": "job already finalized"})
+                    return
+                if st.last_completed_batch_id >= batch_id:
+                    break
+                if st.applied_cv is None:
+                    _json_response(self, 500, {"ok": False, "error": "worker apply condition is not initialized"})
+                    return
+                st.applied_cv.wait(timeout=0.25)
+            apply_metrics = dict(st.last_completed_batch_metrics) if st.last_completed_batch_id == batch_id else {}
 
         _json_response(
             self,
-            202,
+            200,
             {
                 "ok": True,
                 "accepted": True,
+                "applied": True,
+                "duplicate": bool(inflight_duplicate),
                 "job_id": job_id,
                 "shard_id": shard_id,
                 "batch_id": batch_id,
                 "queued": queued,
                 "queue_max": qmax,
                 "last_applied_batch_id": st.last_batch_id,
+                "body_read_time_s": max(0.0, body_read_done - request_started),
+                "post_read_processing_s": max(0.0, time.time() - body_read_done),
+                "apply_time_s": float(apply_metrics.get("apply_time_s", 0.0)),
+                "queue_wait_time_s": float(apply_metrics.get("queue_wait_time_s", 0.0)),
+                "newly_accepted": bool(accepted_new_batch),
+                "request_handling_time_s": max(0.0, time.time() - request_started),
             },
         )
 
@@ -831,12 +1174,12 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 return
             if st.rebalance_plan is None or st.rebalance_plan.routing_epoch != routing_epoch:
                 if routing_epoch <= st.last_routing_epoch and token in st.applied_migration_batches:
-                    _json_response(self, 200, {"ok": True, "duplicate": True, "accepted": True})
+                    _json_response(self, 200, {"ok": True, "duplicate": True, "accepted": True, "apply_time_s": 0.0})
                     return
                 _json_response(self, 409, {"ok": False, "error": f"stale or unknown routing_epoch {routing_epoch}"})
                 return
             if token in st.applied_migration_batches:
-                _json_response(self, 200, {"ok": True, "duplicate": True, "accepted": True})
+                _json_response(self, 200, {"ok": True, "duplicate": True, "accepted": True, "apply_time_s": 0.0})
                 return
             if st.normalized_input is None:
                 st.normalized_input = normalized
@@ -845,14 +1188,17 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 return
             try:
                 st.local_store.append(vectors, global_ids)
-                _apply_vectors_to_index(st, vectors, global_ids, normalized)
+                add_elapsed = _apply_vectors_to_index(
+                    st, vectors, global_ids, normalized, source="migrate_receive"
+                )
                 st.applied_migration_batches.add(token)
+                _maybe_log_memory(st, "migrate_receive")
             except Exception as ex:
                 st.error = f"{type(ex).__name__}: {ex}"
                 _json_response(self, 500, {"ok": False, "error": st.error})
                 return
 
-        _json_response(self, 200, {"ok": True, "accepted": True, "duplicate": False, "count": num})
+        _json_response(self, 200, {"ok": True, "accepted": True, "duplicate": False, "count": num, "apply_time_s": add_elapsed})
 
     def _handle_rebalance(self):
         req = _read_json(self)
@@ -928,6 +1274,11 @@ class WorkerHandler(BaseHTTPRequestHandler):
             st.last_rebalance_migrate_time_s = 0.0
             st.last_rebalance_rebuild_time_s = 0.0
             st.last_rebalance_total_time_s = 0.0
+            st.last_rebalance_migrate_rpc_roundtrip_s = 0.0
+            st.last_rebalance_migrate_remote_apply_time_s = 0.0
+            st.last_rebalance_migrate_comm_time_s = 0.0
+            st.last_rebalance_migrate_batches_sent = 0
+            st.last_rebalance_migrate_vectors_sent = 0
             st.rebalance_plan = RebalancePlan(
                 routing_epoch=routing_epoch,
                 centroids=centroids,
@@ -975,12 +1326,19 @@ class WorkerHandler(BaseHTTPRequestHandler):
         batch_seq = 0
         moved_vectors = 0
         kept_vectors = 0
+        migrate_rpc_roundtrip_s = 0.0
+        migrate_remote_apply_time_s = 0.0
+        migrate_comm_time_s = 0.0
+        migrate_batches_sent = 0
+        migrate_delete_time_s = 0.0
         metric = st.dist
         source_worker_id = st.shard_id
         pending: dict[int, dict[str, list]] = {}
 
         def flush_destination(dest_worker_id: int):
             nonlocal batch_seq, moved_vectors
+            nonlocal migrate_rpc_roundtrip_s, migrate_remote_apply_time_s
+            nonlocal migrate_comm_time_s, migrate_batches_sent, migrate_delete_time_s
             bucket = pending.get(dest_worker_id)
             if not bucket or not bucket["ids"]:
                 return
@@ -1000,10 +1358,15 @@ class WorkerHandler(BaseHTTPRequestHandler):
             )
             if not resp.get("ok", False):
                 raise RuntimeError(f"migrate_batch failed to worker {dest_worker_id}: {resp}")
+            migrate_rpc_roundtrip_s += float(resp.get("_source_rpc_roundtrip_s", 0.0))
+            migrate_remote_apply_time_s += float(resp.get("_destination_apply_time_s", 0.0))
+            migrate_comm_time_s += float(resp.get("_source_comm_time_s", 0.0))
+            migrate_batches_sent += 1
             with st.lock:
-                _delete_vectors_from_index(st, vectors, ids)
+                delete_elapsed = _delete_vectors_from_index(st, vectors, ids)
                 st.local_store.tombstone(positions, vectors)
                 st.vectors_ingested = st.local_store.active_count
+                migrate_delete_time_s += delete_elapsed
             moved_vectors += int(vectors.shape[0])
             batch_seq += 1
             bucket["vectors"].clear()
@@ -1037,10 +1400,18 @@ class WorkerHandler(BaseHTTPRequestHandler):
             st.vectors_ingested = st.local_store.active_count
             elapsed = time.time() - phase_t0
             st.last_rebalance_migrate_time_s = elapsed
+            st.last_rebalance_migrate_rpc_roundtrip_s = migrate_rpc_roundtrip_s
+            st.last_rebalance_migrate_remote_apply_time_s = migrate_remote_apply_time_s
+            st.last_rebalance_migrate_comm_time_s = migrate_comm_time_s
+            st.last_rebalance_migrate_batches_sent = migrate_batches_sent
+            st.last_rebalance_migrate_vectors_sent = moved_vectors
+            _maybe_log_memory(st, "rebalance_migrate", force=True)
 
         print(
             f"[rebalance] shard={st.shard_id} epoch={routing_epoch} "
-            f"phase=migrate moved={moved_vectors} kept={kept_vectors} elapsed={elapsed:.3f}s"
+            f"phase=migrate moved={moved_vectors} kept={kept_vectors} elapsed={elapsed:.3f}s "
+            f"rpc={migrate_rpc_roundtrip_s:.3f}s comm={migrate_comm_time_s:.3f}s "
+            f"delete={migrate_delete_time_s:.3f}s"
         )
         _json_response(
             self,
@@ -1053,6 +1424,11 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 "kept_vectors": kept_vectors,
                 "active_count": st.local_store.active_count,
                 "phase_time_s": elapsed,
+                "migrate_rpc_roundtrip_s": migrate_rpc_roundtrip_s,
+                "migrate_remote_apply_time_s": migrate_remote_apply_time_s,
+                "migrate_comm_time_s": migrate_comm_time_s,
+                "migrate_batches_sent": migrate_batches_sent,
+                "migrate_delete_time_s": migrate_delete_time_s,
             },
         )
 
@@ -1084,8 +1460,15 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     "migrate_phase_s": round(st.last_rebalance_migrate_time_s, 6),
                     "rebuild_phase_s": round(st.last_rebalance_rebuild_time_s, 6),
                     "rebalance_total_s": round(st.last_rebalance_total_time_s, 6),
+                    "migrate_rpc_roundtrip_s": round(st.last_rebalance_migrate_rpc_roundtrip_s, 6),
+                    "migrate_remote_apply_time_s": round(st.last_rebalance_migrate_remote_apply_time_s, 6),
+                    "migrate_comm_time_s": round(st.last_rebalance_migrate_comm_time_s, 6),
+                    "migrate_delete_time_s": round(migrate_delete_time_s, 6),
+                    "migrate_batches_sent": int(st.last_rebalance_migrate_batches_sent),
+                    "migrate_vectors_sent": int(st.last_rebalance_migrate_vectors_sent),
                 }
             )
+            _maybe_log_memory(st, "rebalance_rebuild", force=True)
 
         print(
             f"[rebalance] shard={st.shard_id} epoch={routing_epoch} "
@@ -1106,6 +1489,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
         )
 
     def _handle_checkpoint(self):
+        request_started = time.time()
         req = _read_json(self)
         try:
             job_id = str(req["job_id"])
@@ -1136,6 +1520,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 return
             checkpoint_elapsed, centroid, empty = _save_index_snapshot(st, checkpoint_dir)
             st.checkpoint_time_s = checkpoint_elapsed
+            _maybe_log_memory(st, "checkpoint", force=True)
 
         print(
             f"[checkpoint] shard={shard_id} dir={checkpoint_dir} "
@@ -1153,6 +1538,19 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 "active_vectors": st.local_store.active_count,
                 "checkpoint_time_s": checkpoint_elapsed,
                 "add_time_s": st.add_time_s,
+                "vector_op_summary": _vector_op_summary(st),
+                "batch_insert_summary": _batch_insert_summary(st),
+                "batch_insert_history_size": len(st.batch_insert_history),
+                "batch_insert_history": list(st.batch_insert_history),
+                "build_params": _build_params_payload(
+                    st.cef,
+                    st.max_check_for_refine_graph,
+                    st.graph_neighborhood_scale,
+                ),
+                "memory": _memory_snapshot(),
+                "memory_history_size": len(st.memory_history),
+                "last_memory": st.memory_history[-1] if st.memory_history else None,
+                "memory_history": list(st.memory_history),
                 "elapsed_s": max(0.0, time.time() - st.init_time_s),
                 "last_applied_batch_id": st.last_batch_id,
                 "centroid": centroid.tolist(),
@@ -1162,13 +1560,20 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 "rebalance_migrate_time_s": st.last_rebalance_migrate_time_s,
                 "rebalance_rebuild_time_s": st.last_rebalance_rebuild_time_s,
                 "rebalance_total_time_s": st.last_rebalance_total_time_s,
+                "migrate_rpc_roundtrip_s": st.last_rebalance_migrate_rpc_roundtrip_s,
+                "migrate_remote_apply_time_s": st.last_rebalance_migrate_remote_apply_time_s,
+                "migrate_comm_time_s": st.last_rebalance_migrate_comm_time_s,
+                "migrate_batches_sent": st.last_rebalance_migrate_batches_sent,
+                "migrate_vectors_sent": st.last_rebalance_migrate_vectors_sent,
                 "rebalance_history_size": len(st.rebalance_history),
                 "last_rebalance": st.rebalance_history[-1] if st.rebalance_history else None,
                 "rebalance_history": list(st.rebalance_history),
+                "request_handling_time_s": max(0.0, time.time() - request_started),
             },
         )
 
     def _handle_finalize(self):
+        request_started = time.time()
         req = _read_json(self)
         try:
             job_id = str(req["job_id"])
@@ -1216,6 +1621,14 @@ class WorkerHandler(BaseHTTPRequestHandler):
                         "save_dir": st.save_dir,
                         "add_time_s": st.add_time_s,
                         "finalize_time_s": st.finalize_time_s,
+                        "vector_op_summary": _vector_op_summary(st),
+                        "batch_insert_summary": _batch_insert_summary(st),
+                        "batch_insert_history_size": len(st.batch_insert_history),
+                        "batch_insert_history": list(st.batch_insert_history),
+                        "memory": _memory_snapshot(),
+                        "memory_history_size": len(st.memory_history),
+                        "last_memory": st.memory_history[-1] if st.memory_history else None,
+                        "memory_history": list(st.memory_history),
                         "elapsed_s": max(0.0, time.time() - st.init_time_s),
                         "last_applied_batch_id": st.last_batch_id,
                         "centroid": centroid.tolist(),
@@ -1224,6 +1637,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                         "rebalance_history_size": len(st.rebalance_history),
                         "last_rebalance": st.rebalance_history[-1] if st.rebalance_history else None,
                         "rebalance_history": list(st.rebalance_history),
+                        "request_handling_time_s": max(0.0, time.time() - request_started),
                     },
                 )
                 if getattr(self.server, "exit_after_finalize", False):
@@ -1232,6 +1646,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
             fin_elapsed, centroid, _ = _save_index_snapshot(st, st.save_dir)
             st.finalized = True
             st.finalize_time_s = fin_elapsed
+            _maybe_log_memory(st, "finalize", force=True)
 
         _json_response(
             self,
@@ -1245,6 +1660,14 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 "save_dir": st.save_dir,
                 "add_time_s": st.add_time_s,
                 "finalize_time_s": st.finalize_time_s,
+                "vector_op_summary": _vector_op_summary(st),
+                "batch_insert_summary": _batch_insert_summary(st),
+                "batch_insert_history_size": len(st.batch_insert_history),
+                "batch_insert_history": list(st.batch_insert_history),
+                "memory": _memory_snapshot(),
+                "memory_history_size": len(st.memory_history),
+                "last_memory": st.memory_history[-1] if st.memory_history else None,
+                "memory_history": list(st.memory_history),
                 "elapsed_s": max(0.0, time.time() - st.init_time_s),
                 "last_applied_batch_id": st.last_batch_id,
                 "centroid": centroid.tolist(),
@@ -1254,9 +1677,15 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 "rebalance_migrate_time_s": st.last_rebalance_migrate_time_s,
                 "rebalance_rebuild_time_s": st.last_rebalance_rebuild_time_s,
                 "rebalance_total_time_s": st.last_rebalance_total_time_s,
+                "migrate_rpc_roundtrip_s": st.last_rebalance_migrate_rpc_roundtrip_s,
+                "migrate_remote_apply_time_s": st.last_rebalance_migrate_remote_apply_time_s,
+                "migrate_comm_time_s": st.last_rebalance_migrate_comm_time_s,
+                "migrate_batches_sent": st.last_rebalance_migrate_batches_sent,
+                "migrate_vectors_sent": st.last_rebalance_migrate_vectors_sent,
                 "rebalance_history_size": len(st.rebalance_history),
                 "last_rebalance": st.rebalance_history[-1] if st.rebalance_history else None,
                 "rebalance_history": list(st.rebalance_history),
+                "request_handling_time_s": max(0.0, time.time() - request_started),
             },
         )
 
@@ -1283,6 +1712,12 @@ def main():
     parser.add_argument("--migrate_batch_size", type=int, default=2048)
     parser.add_argument("--rebuild_batch_size", type=int, default=2048)
     parser.add_argument(
+        "--memory_log_interval_vectors",
+        type=int,
+        default=0,
+        help="Log worker memory usage each time active vectors cross this interval; 0 disables periodic memory logs.",
+    )
+    parser.add_argument(
         "--no_exit_after_finalize",
         action="store_true",
         help="Keep worker running after a successful /finalize.",
@@ -1296,9 +1731,11 @@ def main():
     server.peer_retries = args.peer_retries
     server.migrate_batch_size = args.migrate_batch_size
     server.rebuild_batch_size = args.rebuild_batch_size
+    server.memory_log_interval_vectors = args.memory_log_interval_vectors
     print(
         f"Worker listening on {args.host}:{args.port} queue_max_batches={args.queue_max_batches} "
-        f"migrate_batch_size={args.migrate_batch_size}"
+        f"migrate_batch_size={args.migrate_batch_size} "
+        f"memory_log_interval_vectors={args.memory_log_interval_vectors}"
     )
     serve_thread = threading.Thread(target=server.serve_forever, name="worker-http")
     serve_thread.start()

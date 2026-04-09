@@ -93,17 +93,29 @@ def _send_batch_with_backpressure(
     retries: int,
     what: str,
 ):
+    total_rpc_roundtrip_s = 0.0
+    total_backpressure_sleep_s = 0.0
+    attempts = 0
     while True:
+        t0 = time.time()
         resp = _post_with_retry(
             url,
             lambda p=payload: _http_binary_post(url, p, request_timeout),
             retries,
             what,
         )
+        total_rpc_roundtrip_s += time.time() - t0
+        attempts += 1
         if resp.get("queue_full", False):
             delay_ms = int(resp.get("retry_after_ms", 200))
-            time.sleep(max(0.0, delay_ms / 1000.0))
+            sleep_s = max(0.0, delay_ms / 1000.0)
+            total_backpressure_sleep_s += sleep_s
+            time.sleep(sleep_s)
             continue
+        resp = dict(resp)
+        resp["_rpc_roundtrip_s"] = total_rpc_roundtrip_s
+        resp["_backpressure_sleep_s"] = total_backpressure_sleep_s
+        resp["_attempts"] = attempts
         return resp
 
 
@@ -162,7 +174,32 @@ def main():
     parser.add_argument("--batch_size", type=int, default=10000)
     parser.add_argument("--algo", default="BKT", choices=["BKT", "KDT", "SPANN"])
     parser.add_argument("--dist", default="L2", choices=["L2", "Cosine"])
-    parser.add_argument("--threads", type=int, default=max(1, os.cpu_count() or 1))
+    parser.add_argument("--value_type", default="Float", choices=["Float", "UInt8"])
+    parser.add_argument("--cef", type=int, default=None, help="Optional SPTAG CEF build parameter.")
+    parser.add_argument(
+        "--max_check_for_refine_graph",
+        type=int,
+        default=None,
+        help="Optional SPTAG MaxCheckForRefineGraph build parameter.",
+    )
+    parser.add_argument(
+        "--graph_neighborhood_scale",
+        type=float,
+        default=None,
+        help="Optional SPTAG GraphNeighborhoodScale build parameter.",
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=max(1, os.cpu_count() or 1),
+        help="Worker-side SPTAG build threads passed to /init.",
+    )
+    parser.add_argument(
+        "--client_threads",
+        type=int,
+        default=1,
+        help="Client sender threads. Only sequential mode is supported, so this must be 1.",
+    )
     parser.add_argument("--with_meta_index", action="store_true")
     parser.add_argument("--request_timeout", type=int, default=60)
     parser.add_argument("--checkpoint_timeout", type=int, default=600)
@@ -182,6 +219,14 @@ def main():
 
     if args.batch_size <= 0:
         raise ValueError("--batch_size must be > 0")
+    if int(args.client_threads) != 1:
+        raise ValueError("Only sequential client sending is supported; set --client_threads=1")
+    if args.cef is not None and int(args.cef) <= 0:
+        raise ValueError("--cef must be > 0")
+    if args.max_check_for_refine_graph is not None and int(args.max_check_for_refine_graph) <= 0:
+        raise ValueError("--max_check_for_refine_graph must be > 0")
+    if args.graph_neighborhood_scale is not None and float(args.graph_neighborhood_scale) <= 0:
+        raise ValueError("--graph_neighborhood_scale must be > 0")
 
     master_url = args.master_url.rstrip("/")
     if not master_url.startswith("http://") and not master_url.startswith("https://"):
@@ -215,10 +260,22 @@ def main():
 
     print(f"Dataset: {base_path} (dim={dim}, total={total_points})")
     print(f"Subset: [{subset_start}, {subset_end}) size={subset_n}")
+    print(
+        f"Client send mode: sequential (client_threads=1, worker_threads={int(args.threads)}, "
+        f"value_type={args.value_type})"
+    )
     if args.phase_label:
         print(f"Phase: {args.phase_label}")
 
     # ── Init ────────────────────────────────────────────────────────────
+    client_master_init_rpc_roundtrip_s = 0.0
+    client_master_init_comm_overhead_s = 0.0
+    client_master_add_rpc_roundtrip_s = 0.0
+    client_master_add_comm_overhead_s = 0.0
+    client_master_add_backpressure_sleep_s = 0.0
+    client_master_checkpoint_rpc_roundtrip_s = 0.0
+    client_master_checkpoint_comm_overhead_s = 0.0
+
     if args.skip_init:
         print(f"Master init skipped for existing job: {args.job_id}")
     else:
@@ -226,20 +283,32 @@ def main():
             "job_id": args.job_id,
             "algo": args.algo,
             "dist": args.dist,
+            "value_type": args.value_type,
             "dim": dim,
             "output_dir": args.output_dir,
             "threads": args.threads,
             "with_meta_index": args.with_meta_index,
         }
+        if args.cef is not None:
+            init_payload["cef"] = int(args.cef)
+        if args.max_check_for_refine_graph is not None:
+            init_payload["max_check_for_refine_graph"] = int(args.max_check_for_refine_graph)
+        if args.graph_neighborhood_scale is not None:
+            init_payload["graph_neighborhood_scale"] = float(args.graph_neighborhood_scale)
         init_url = f"{master_url}/init"
+        init_t0 = time.time()
         init_resp = _post_with_retry(
             init_url,
             lambda: _http_json_post(init_url, init_payload, args.request_timeout),
             args.retries,
             "init",
         )
+        client_master_init_rpc_roundtrip_s = time.time() - init_t0
         if not init_resp.get("ok", False):
             raise RuntimeError(f"Master /init failed: {init_resp}")
+        client_master_init_comm_overhead_s = max(
+            0.0, client_master_init_rpc_roundtrip_s - float(init_resp.get("request_total_s", 0.0))
+        )
         num_shards = init_resp.get("num_shards", "?")
         registered_workers = init_resp.get("registered_workers", num_shards)
         print(f"Master initialized: {num_shards} shard(s) active, {registered_workers} worker(s) registered")
@@ -280,6 +349,12 @@ def main():
         )
         if not resp.get("ok", False):
             raise RuntimeError(f"add_batch failed at offset={global_offset}: {resp}")
+        batch_rpc_roundtrip_s = float(resp.get("_rpc_roundtrip_s", 0.0))
+        batch_backpressure_sleep_s = float(resp.get("_backpressure_sleep_s", 0.0))
+        batch_master_request_total_s = float(resp.get("request_total_s", 0.0))
+        client_master_add_rpc_roundtrip_s += batch_rpc_roundtrip_s
+        client_master_add_backpressure_sleep_s += batch_backpressure_sleep_s
+        client_master_add_comm_overhead_s += max(0.0, batch_rpc_roundtrip_s - batch_master_request_total_s)
 
         batch_count += 1
         sent = off + n
@@ -302,14 +377,19 @@ def main():
         checkpoint_payload = {"job_id": args.job_id}
         if args.checkpoint_id:
             checkpoint_payload["checkpoint_id"] = args.checkpoint_id
+        checkpoint_t0 = time.time()
         checkpoint_resp = _post_with_retry(
             checkpoint_url,
             lambda: _http_json_post(checkpoint_url, checkpoint_payload, args.checkpoint_timeout),
             args.retries,
             "checkpoint",
         )
+        client_master_checkpoint_rpc_roundtrip_s = time.time() - checkpoint_t0
         if not checkpoint_resp.get("ok", False):
             raise RuntimeError(f"Master /checkpoint failed: {checkpoint_resp}")
+        client_master_checkpoint_comm_overhead_s = max(
+            0.0, client_master_checkpoint_rpc_roundtrip_s - float(checkpoint_resp.get("request_total_s", 0.0))
+        )
         print(
             f"[checkpoint] id={checkpoint_resp.get('checkpoint_id')} "
             f"dir={checkpoint_resp.get('checkpoint_dir')} "
@@ -346,8 +426,28 @@ def main():
         print("[phase done] final action skipped")
 
     total_elapsed = time.time() - total_t0
+    client_master_total_comm_overhead_s = (
+        client_master_init_comm_overhead_s
+        + client_master_add_comm_overhead_s
+        + client_master_checkpoint_comm_overhead_s
+    )
     print("Distributed build phase completed successfully.")
     print(f"[timing] total={total_elapsed:.3f}s add_phase={add_elapsed:.3f}s")
+    print(
+        f"[comm] client_master_init_rpc={client_master_init_rpc_roundtrip_s:.3f}s "
+        f"client_master_init_comm={client_master_init_comm_overhead_s:.3f}s"
+    )
+    print(
+        f"[comm] client_master_add_rpc={client_master_add_rpc_roundtrip_s:.3f}s "
+        f"client_master_add_comm={client_master_add_comm_overhead_s:.3f}s "
+        f"client_master_add_backpressure_sleep={client_master_add_backpressure_sleep_s:.3f}s"
+    )
+    if args.final_action == "checkpoint":
+        print(
+            f"[comm] client_master_checkpoint_rpc={client_master_checkpoint_rpc_roundtrip_s:.3f}s "
+            f"client_master_checkpoint_comm={client_master_checkpoint_comm_overhead_s:.3f}s"
+        )
+    print(f"[comm] client_master_total_comm={client_master_total_comm_overhead_s:.3f}s")
 
 
 if __name__ == "__main__":

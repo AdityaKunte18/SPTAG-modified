@@ -101,17 +101,29 @@ def _send_batch_with_backpressure(
     retries: int,
     what: str,
 ):
+    total_rpc_roundtrip_s = 0.0
+    total_backpressure_sleep_s = 0.0
+    attempts = 0
     while True:
+        t0 = time.time()
         resp = _post_with_retry(
             url,
             lambda p=payload: _http_binary_post(url, p, request_timeout),
             retries,
             what,
         )
+        total_rpc_roundtrip_s += time.time() - t0
+        attempts += 1
         if resp.get("queue_full", False):
             delay_ms = int(resp.get("retry_after_ms", 200))
-            time.sleep(max(0.0, delay_ms / 1000.0))
+            sleep_s = max(0.0, delay_ms / 1000.0)
+            total_backpressure_sleep_s += sleep_s
+            time.sleep(sleep_s)
             continue
+        resp = dict(resp)
+        resp["_rpc_roundtrip_s"] = total_rpc_roundtrip_s
+        resp["_backpressure_sleep_s"] = total_backpressure_sleep_s
+        resp["_attempts"] = attempts
         return resp
 
 
@@ -155,6 +167,32 @@ def _distance_matrix(vectors: np.ndarray, centroids: np.ndarray, metric: str) ->
 
 def _seed_for_job(job_id: str, suffix: str = "") -> int:
     return zlib.crc32(f"{job_id}:{suffix}".encode("utf-8")) & 0xFFFFFFFF
+
+
+def _optional_positive_int(value, name: str) -> int | None:
+    if value is None or value == "":
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"{name} must be > 0")
+    return parsed
+
+
+def _optional_positive_float(value, name: str) -> float | None:
+    if value is None or value == "":
+        return None
+    parsed = float(value)
+    if parsed <= 0:
+        raise ValueError(f"{name} must be > 0")
+    return parsed
+
+
+def _build_params_payload(cef: int | None, max_check_for_refine_graph: int | None, graph_neighborhood_scale: float | None) -> dict:
+    return {
+        "cef": cef,
+        "max_check_for_refine_graph": max_check_for_refine_graph,
+        "graph_neighborhood_scale": graph_neighborhood_scale,
+    }
 
 
 def _kmeans_plus_plus(vectors: np.ndarray, k: int, metric: str, seed: int) -> np.ndarray:
@@ -286,19 +324,79 @@ class BufferedBatch:
     normalized: bool
 
 
+def _new_communication_summary() -> dict[str, float | int]:
+    return {
+        "init_worker_rpc_roundtrip_s": 0.0,
+        "init_worker_comm_overhead_s": 0.0,
+        "init_worker_count": 0,
+        "ingest_worker_rpc_roundtrip_s": 0.0,
+        "ingest_worker_rpc_roundtrip_max_s": 0.0,
+        "ingest_worker_fanout_wall_time_s": 0.0,
+        "ingest_worker_comm_overhead_s": 0.0,
+        "ingest_worker_request_total_s": 0.0,
+        "ingest_worker_body_read_time_s": 0.0,
+        "ingest_worker_processing_after_read_s": 0.0,
+        "ingest_worker_processing_after_read_max_s": 0.0,
+        "ingest_worker_apply_time_s": 0.0,
+        "ingest_worker_queue_wait_s": 0.0,
+        "ingest_worker_backpressure_sleep_s": 0.0,
+        "ingest_worker_batches": 0,
+        "ingest_worker_vectors": 0,
+        "checkpoint_worker_rpc_roundtrip_s": 0.0,
+        "checkpoint_worker_comm_overhead_s": 0.0,
+        "checkpoint_worker_count": 0,
+        "finalize_worker_rpc_roundtrip_s": 0.0,
+        "finalize_worker_comm_overhead_s": 0.0,
+        "finalize_worker_count": 0,
+    }
+
+
+def _build_elapsed_s(job: "MasterJobState", now: float | None = None) -> float:
+    ref = time.time() if now is None else now
+    if job.build_pause_started_at is not None:
+        ref = min(ref, job.build_pause_started_at)
+    return max(0.0, ref - job.init_time - job.build_paused_time_s)
+
+
+def _wall_elapsed_s(job: "MasterJobState", now: float | None = None) -> float:
+    ref = time.time() if now is None else now
+    return max(0.0, ref - job.init_time)
+
+
+def _pause_build_timing(job: "MasterJobState") -> bool:
+    if job.build_pause_started_at is not None:
+        return False
+    job.build_pause_started_at = time.time()
+    return True
+
+
+def _resume_build_timing(job: "MasterJobState") -> bool:
+    if job.build_pause_started_at is None:
+        return False
+    job.build_paused_time_s += max(0.0, time.time() - job.build_pause_started_at)
+    job.build_pause_started_at = None
+    return True
+
+
 @dataclass
 class MasterJobState:
     job_id: str
     dim: int
     algo: str
     dist: str
+    value_type: str
     output_dir: str
     threads: int
+    cef: int | None
+    max_check_for_refine_graph: int | None
+    graph_neighborhood_scale: float | None
     with_meta_index: bool
     shards: list[ShardInfo] = field(default_factory=list)
     finalized: bool = False
     error: str | None = None
     init_time: float = 0.0
+    build_paused_time_s: float = 0.0
+    build_pause_started_at: float | None = None
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
     total_vectors_ingested: int = 0
 
@@ -318,6 +416,7 @@ class MasterJobState:
     rebalance_history: list[dict] = field(default_factory=list, repr=False)
     latest_checkpoint_dir: str | None = None
     latest_checkpoint_centers_file: str | None = None
+    communication_summary: dict[str, float | int] = field(default_factory=_new_communication_summary, repr=False)
 
 
 STATE: dict[str, MasterJobState] = {}
@@ -477,12 +576,17 @@ def _init_worker_for_job(
         "shard_id": worker.worker_id,
         "algo": job.algo,
         "dist": job.dist,
+        "value_type": job.value_type,
         "threads": job.threads,
+        "cef": job.cef,
+        "max_check_for_refine_graph": job.max_check_for_refine_graph,
+        "graph_neighborhood_scale": job.graph_neighborhood_scale,
         "dim": job.dim,
         "save_dir": save_dir,
         "with_meta_index": job.with_meta_index,
     }
     url = f"{worker.base_url}/init"
+    t0 = time.time()
     resp = _post_with_retry(
         url,
         lambda u=url, p=worker_init: _http_json_post(u, p, request_timeout),
@@ -495,6 +599,11 @@ def _init_worker_for_job(
     shard = ShardInfo(shard_id=worker.worker_id, worker=worker)
     job.shards.append(shard)
     job.shards.sort(key=lambda s: s.shard_id)
+    rpc_roundtrip_s = time.time() - t0
+    request_handling_s = float(resp.get("request_handling_time_s", 0.0))
+    job.communication_summary["init_worker_rpc_roundtrip_s"] += rpc_roundtrip_s
+    job.communication_summary["init_worker_comm_overhead_s"] += max(0.0, rpc_roundtrip_s - request_handling_s)
+    job.communication_summary["init_worker_count"] += 1
     print(f"[init] shard={worker.worker_id} worker={worker.host}:{worker.port} save={save_dir}")
     return shard
 
@@ -699,22 +808,24 @@ def _route_vectors_to_workers(job: MasterJobState, vectors: np.ndarray, metric: 
 def _forward_sub_batch(
     *,
     server,
-    job: MasterJobState,
+    job_id: str,
+    dim: int,
+    with_meta_index: bool,
     shard: ShardInfo,
+    batch_id: int,
     vectors: np.ndarray,
     global_ids: np.ndarray,
     normalized: bool,
-) -> None:
+) -> dict:
     vectors = np.ascontiguousarray(vectors, dtype=np.float32)
     global_ids = np.ascontiguousarray(global_ids, dtype=np.int64)
-    batch_id = shard.next_batch_id
     worker_meta = {
-        "job_id": job.job_id,
+        "job_id": job_id,
         "shard_id": shard.shard_id,
         "batch_id": batch_id,
         "num": int(vectors.shape[0]),
-        "dim": job.dim,
-        "with_meta_index": job.with_meta_index,
+        "dim": dim,
+        "with_meta_index": with_meta_index,
         "normalized": normalized,
         "ids": global_ids.astype(np.int64).tolist(),
     }
@@ -730,31 +841,166 @@ def _forward_sub_batch(
     )
     if not resp.get("ok", False):
         raise RuntimeError(f"worker add_batch failed shard={shard.shard_id} batch={batch_id}: {resp}")
-    shard.next_batch_id += 1
-    shard.vectors_forwarded += int(vectors.shape[0])
-    _update_worker_stats(job, shard.worker.worker_id, vectors)
     if server.debug:
         print(
             f"[debug] forwarded shard={shard.shard_id} batch={batch_id} "
             f"count={vectors.shape[0]} ids=[{int(global_ids[0])}..{int(global_ids[-1])}]"
         )
+    rpc_roundtrip_s = float(resp.get("_rpc_roundtrip_s", 0.0))
+    request_handling_s = float(resp.get("request_handling_time_s", 0.0))
+    body_read_time_s = float(resp.get("body_read_time_s", 0.0))
+    processing_after_read_s = float(resp.get("post_read_processing_s", request_handling_s))
+    apply_time_s = float(resp.get("apply_time_s", 0.0))
+    queue_wait_time_s = float(resp.get("queue_wait_time_s", 0.0))
+    backpressure_sleep_s = float(resp.get("_backpressure_sleep_s", 0.0))
+    return {
+        "worker_id": int(shard.worker.worker_id),
+        "shard_id": int(shard.shard_id),
+        "batch_id": int(batch_id),
+        "rpc_roundtrip_s": rpc_roundtrip_s,
+        "request_handling_time_s": request_handling_s,
+        "body_read_time_s": body_read_time_s,
+        "processing_after_read_s": processing_after_read_s,
+        "apply_time_s": apply_time_s,
+        "queue_wait_time_s": queue_wait_time_s,
+        "comm_overhead_s": max(0.0, rpc_roundtrip_s - processing_after_read_s),
+        "backpressure_sleep_s": backpressure_sleep_s,
+        "attempts": int(resp.get("_attempts", 1)),
+        "vectors": int(vectors.shape[0]),
+    }
 
 
-def _forward_routed_batch(server, job: MasterJobState, vectors: np.ndarray, global_ids: np.ndarray, normalized: bool) -> int:
+def _forward_routed_batch(server, job: MasterJobState, vectors: np.ndarray, global_ids: np.ndarray, normalized: bool) -> dict:
     active = _active_shards(job)
     if not active:
         raise RuntimeError("no active shards available")
     assignments = _route_vectors_to_workers(job, vectors, job.dist)
-    touched = 0
+    routed_batches = []
     for local_idx, shard in enumerate(active):
         rows = np.flatnonzero(assignments == local_idx)
         if rows.size == 0:
             continue
-        sub_vectors = np.ascontiguousarray(vectors[rows], dtype=np.float32)
-        sub_ids = np.ascontiguousarray(global_ids[rows], dtype=np.int64)
-        _forward_sub_batch(server=server, job=job, shard=shard, vectors=sub_vectors, global_ids=sub_ids, normalized=normalized)
+        routed_batches.append(
+            {
+                "shard": shard,
+                "batch_id": int(shard.next_batch_id),
+                "vectors": np.ascontiguousarray(vectors[rows], dtype=np.float32),
+                "global_ids": np.ascontiguousarray(global_ids[rows], dtype=np.int64),
+            }
+        )
+    if not routed_batches:
+        return {
+            "shards_touched": 0,
+            "worker_rpc_roundtrip_s": 0.0,
+            "worker_rpc_roundtrip_max_s": 0.0,
+            "worker_fanout_wall_time_s": 0.0,
+            "worker_request_handling_s": 0.0,
+            "worker_body_read_time_s": 0.0,
+            "worker_processing_after_read_s": 0.0,
+            "worker_processing_after_read_max_s": 0.0,
+            "worker_apply_time_s": 0.0,
+            "worker_queue_wait_time_s": 0.0,
+            "worker_comm_overhead_s": 0.0,
+            "worker_backpressure_sleep_s": 0.0,
+            "worker_attempts": 0,
+        }
+
+    touched = 0
+    rpc_roundtrip_s = 0.0
+    rpc_roundtrip_max_s = 0.0
+    fanout_wall_time_s = 0.0
+    request_handling_s = 0.0
+    body_read_time_s = 0.0
+    processing_after_read_s = 0.0
+    processing_after_read_max_s = 0.0
+    apply_time_s = 0.0
+    queue_wait_time_s = 0.0
+    comm_overhead_s = 0.0
+    backpressure_sleep_s = 0.0
+    attempts = 0
+    forward_started_at = time.time()
+    future_map = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(routed_batches)) as executor:
+        for routed in routed_batches:
+            future = executor.submit(
+                _forward_sub_batch,
+                server=server,
+                job_id=job.job_id,
+                dim=job.dim,
+                with_meta_index=job.with_meta_index,
+                shard=routed["shard"],
+                batch_id=routed["batch_id"],
+                vectors=routed["vectors"],
+                global_ids=routed["global_ids"],
+                normalized=normalized,
+            )
+            future_map[future] = routed
+
+        forward_results = []
+        first_error: Exception | None = None
+        for future in concurrent.futures.as_completed(future_map):
+            routed = future_map[future]
+            try:
+                metrics = future.result()
+            except Exception as ex:
+                if first_error is None:
+                    first_error = ex
+                continue
+            forward_results.append((routed, metrics))
+
+    fanout_wall_time_s = max(0.0, time.time() - forward_started_at)
+    if first_error is not None:
+        raise first_error
+
+    for routed, metrics in forward_results:
+        shard = routed["shard"]
+        sub_vectors = routed["vectors"]
         touched += 1
-    return touched
+        shard.next_batch_id += 1
+        shard.vectors_forwarded += int(sub_vectors.shape[0])
+        _update_worker_stats(job, shard.worker.worker_id, sub_vectors)
+        rpc_roundtrip_s += float(metrics.get("rpc_roundtrip_s", 0.0))
+        rpc_roundtrip_max_s = max(rpc_roundtrip_max_s, float(metrics.get("rpc_roundtrip_s", 0.0)))
+        request_handling_s += float(metrics.get("request_handling_time_s", 0.0))
+        body_read_time_s += float(metrics.get("body_read_time_s", 0.0))
+        processing_after_read_s += float(metrics.get("processing_after_read_s", 0.0))
+        processing_after_read_max_s = max(
+            processing_after_read_max_s, float(metrics.get("processing_after_read_s", 0.0))
+        )
+        apply_time_s += float(metrics.get("apply_time_s", 0.0))
+        queue_wait_time_s += float(metrics.get("queue_wait_time_s", 0.0))
+        backpressure_sleep_s += float(metrics.get("backpressure_sleep_s", 0.0))
+        attempts += int(metrics.get("attempts", 0))
+
+    comm_overhead_s = max(0.0, fanout_wall_time_s - processing_after_read_max_s)
+    job.communication_summary["ingest_worker_rpc_roundtrip_s"] += rpc_roundtrip_s
+    job.communication_summary["ingest_worker_rpc_roundtrip_max_s"] += rpc_roundtrip_max_s
+    job.communication_summary["ingest_worker_fanout_wall_time_s"] += fanout_wall_time_s
+    job.communication_summary["ingest_worker_comm_overhead_s"] += comm_overhead_s
+    job.communication_summary["ingest_worker_request_total_s"] += request_handling_s
+    job.communication_summary["ingest_worker_body_read_time_s"] += body_read_time_s
+    job.communication_summary["ingest_worker_processing_after_read_s"] += processing_after_read_s
+    job.communication_summary["ingest_worker_processing_after_read_max_s"] += processing_after_read_max_s
+    job.communication_summary["ingest_worker_apply_time_s"] += apply_time_s
+    job.communication_summary["ingest_worker_queue_wait_s"] += queue_wait_time_s
+    job.communication_summary["ingest_worker_backpressure_sleep_s"] += backpressure_sleep_s
+    job.communication_summary["ingest_worker_batches"] += touched
+    job.communication_summary["ingest_worker_vectors"] += int(global_ids.shape[0])
+    return {
+        "shards_touched": touched,
+        "worker_rpc_roundtrip_s": rpc_roundtrip_s,
+        "worker_rpc_roundtrip_max_s": rpc_roundtrip_max_s,
+        "worker_fanout_wall_time_s": fanout_wall_time_s,
+        "worker_request_handling_s": request_handling_s,
+        "worker_body_read_time_s": body_read_time_s,
+        "worker_processing_after_read_s": processing_after_read_s,
+        "worker_processing_after_read_max_s": processing_after_read_max_s,
+        "worker_apply_time_s": apply_time_s,
+        "worker_queue_wait_time_s": queue_wait_time_s,
+        "worker_comm_overhead_s": comm_overhead_s,
+        "worker_backpressure_sleep_s": backpressure_sleep_s,
+        "worker_attempts": attempts,
+    }
 
 
 def _bootstrap_if_ready(server, job: MasterJobState, *, force: bool) -> bool:
@@ -849,14 +1095,20 @@ def _prepare_rebalance_plan(job: MasterJobState) -> tuple[list[int], list[int], 
 
 def _send_rebalance_phase(server, shard: ShardInfo, payload: dict, timeout_s: int) -> dict:
     url = f"{shard.worker.base_url}/rebalance"
+    t0 = time.time()
     resp = _post_with_retry(
         url,
         lambda u=url, p=payload: _http_json_post(u, p, timeout_s),
         server.retries,
         f"rebalance shard {shard.shard_id} phase {payload['phase']}",
     )
+    rpc_elapsed = time.time() - t0
     if not resp.get("ok", False):
         raise RuntimeError(f"rebalance phase {payload['phase']} failed for shard {shard.shard_id}: {resp}")
+    resp = dict(resp)
+    worker_phase_time = float(resp.get("phase_time_s", 0.0))
+    resp["_master_rpc_roundtrip_s"] = rpc_elapsed
+    resp["_master_comm_overhead_s"] = max(0.0, rpc_elapsed - worker_phase_time)
     return resp
 
 
@@ -972,6 +1224,12 @@ def _run_rebalance(server, job_id: str, routing_epoch: int) -> None:
                 rebuild_results[worker_id] = future.result()
         rebuild_elapsed = time.time() - rebuild_started
         total_elapsed = time.time() - rebalance_started
+        prepare_max_worker_phase_s = max((float(result.get("phase_time_s", 0.0)) for result in prepare_results.values()), default=0.0)
+        migrate_max_worker_phase_s = max((float(result.get("phase_time_s", 0.0)) for result in migrate_results.values()), default=0.0)
+        rebuild_max_worker_phase_s = max((float(result.get("phase_time_s", 0.0)) for result in rebuild_results.values()), default=0.0)
+        prepare_master_phase_overhead_s = max(0.0, prepare_elapsed - prepare_max_worker_phase_s)
+        migrate_master_phase_overhead_s = max(0.0, migrate_elapsed - migrate_max_worker_phase_s)
+        rebuild_master_phase_overhead_s = max(0.0, rebuild_elapsed - rebuild_max_worker_phase_s)
 
         rebalance_record = {
             "routing_epoch": int(routing_epoch),
@@ -984,6 +1242,58 @@ def _run_rebalance(server, job_id: str, routing_epoch: int) -> None:
             "migrate_phase_s": round(migrate_elapsed, 6),
             "rebuild_phase_s": round(rebuild_elapsed, 6),
             "rebalance_total_s": round(total_elapsed, 6),
+            "prepare_master_rpc_roundtrip_s": {
+                str(worker_id): round(float(result.get("_master_rpc_roundtrip_s", 0.0)), 6)
+                for worker_id, result in sorted(prepare_results.items())
+            },
+            "prepare_master_comm_overhead_s": {
+                str(worker_id): round(float(result.get("_master_comm_overhead_s", 0.0)), 6)
+                for worker_id, result in sorted(prepare_results.items())
+            },
+            "prepare_master_rpc_total_s": round(
+                sum(float(result.get("_master_rpc_roundtrip_s", 0.0)) for result in prepare_results.values()), 6
+            ),
+            "prepare_master_comm_total_s": round(
+                sum(float(result.get("_master_comm_overhead_s", 0.0)) for result in prepare_results.values()), 6
+            ),
+            "prepare_master_max_worker_phase_s": round(prepare_max_worker_phase_s, 6),
+            "prepare_master_phase_overhead_s": round(prepare_master_phase_overhead_s, 6),
+            "migrate_master_rpc_roundtrip_s": {
+                str(worker_id): round(float(result.get("_master_rpc_roundtrip_s", 0.0)), 6)
+                for worker_id, result in sorted(migrate_results.items())
+            },
+            "migrate_master_comm_overhead_s": {
+                str(worker_id): round(float(result.get("_master_comm_overhead_s", 0.0)), 6)
+                for worker_id, result in sorted(migrate_results.items())
+            },
+            "migrate_master_rpc_total_s": round(
+                sum(float(result.get("_master_rpc_roundtrip_s", 0.0)) for result in migrate_results.values()), 6
+            ),
+            "migrate_master_comm_total_s": round(
+                sum(float(result.get("_master_comm_overhead_s", 0.0)) for result in migrate_results.values()), 6
+            ),
+            "migrate_master_max_worker_phase_s": round(migrate_max_worker_phase_s, 6),
+            "migrate_master_phase_overhead_s": round(migrate_master_phase_overhead_s, 6),
+            "rebuild_master_rpc_roundtrip_s": {
+                str(worker_id): round(float(result.get("_master_rpc_roundtrip_s", 0.0)), 6)
+                for worker_id, result in sorted(rebuild_results.items())
+            },
+            "rebuild_master_comm_overhead_s": {
+                str(worker_id): round(float(result.get("_master_comm_overhead_s", 0.0)), 6)
+                for worker_id, result in sorted(rebuild_results.items())
+            },
+            "rebuild_master_rpc_total_s": round(
+                sum(float(result.get("_master_rpc_roundtrip_s", 0.0)) for result in rebuild_results.values()), 6
+            ),
+            "rebuild_master_comm_total_s": round(
+                sum(float(result.get("_master_comm_overhead_s", 0.0)) for result in rebuild_results.values()), 6
+            ),
+            "rebuild_master_max_worker_phase_s": round(rebuild_max_worker_phase_s, 6),
+            "rebuild_master_phase_overhead_s": round(rebuild_master_phase_overhead_s, 6),
+            "master_rebalance_overhead_s": round(
+                prepare_master_phase_overhead_s + migrate_master_phase_overhead_s + rebuild_master_phase_overhead_s,
+                6,
+            ),
             "prepare_worker_phase_s": {
                 str(worker_id): float(result.get("phase_time_s", 0.0))
                 for worker_id, result in sorted(prepare_results.items())
@@ -999,6 +1309,30 @@ def _run_rebalance(server, job_id: str, routing_epoch: int) -> None:
             "worker_rebalance_total_s": {
                 str(worker_id): float(result.get("rebalance_total_time_s", 0.0))
                 for worker_id, result in sorted(rebuild_results.items())
+            },
+            "worker_migrate_rpc_roundtrip_s": {
+                str(worker_id): float(result.get("migrate_rpc_roundtrip_s", 0.0))
+                for worker_id, result in sorted(migrate_results.items())
+            },
+            "worker_migrate_remote_apply_time_s": {
+                str(worker_id): float(result.get("migrate_remote_apply_time_s", 0.0))
+                for worker_id, result in sorted(migrate_results.items())
+            },
+            "worker_migrate_comm_time_s": {
+                str(worker_id): float(result.get("migrate_comm_time_s", 0.0))
+                for worker_id, result in sorted(migrate_results.items())
+            },
+            "worker_migrate_delete_time_s": {
+                str(worker_id): float(result.get("migrate_delete_time_s", 0.0))
+                for worker_id, result in sorted(migrate_results.items())
+            },
+            "worker_migrate_batches_sent": {
+                str(worker_id): int(result.get("migrate_batches_sent", 0))
+                for worker_id, result in sorted(migrate_results.items())
+            },
+            "worker_migrate_vectors_sent": {
+                str(worker_id): int(result.get("moved_vectors", 0))
+                for worker_id, result in sorted(migrate_results.items())
             },
         }
 
@@ -1023,7 +1357,11 @@ def _run_rebalance(server, job_id: str, routing_epoch: int) -> None:
             f"[rebalance] epoch={routing_epoch} total_vectors={triggered_total_vectors} "
             f"workers={target_worker_ids} drain={drain_elapsed:.3f}s "
             f"prepare={prepare_elapsed:.3f}s migrate={migrate_elapsed:.3f}s "
-            f"rebuild={rebuild_elapsed:.3f}s total={total_elapsed:.3f}s"
+            f"rebuild={rebuild_elapsed:.3f}s total={total_elapsed:.3f}s "
+            f"master_overhead={rebalance_record['master_rebalance_overhead_s']:.3f}s "
+            f"master_prepare_comm={rebalance_record['prepare_master_comm_total_s']:.3f}s "
+            f"master_migrate_comm={rebalance_record['migrate_master_comm_total_s']:.3f}s "
+            f"master_rebuild_comm={rebalance_record['rebuild_master_comm_total_s']:.3f}s"
         )
 
     except Exception as ex:
@@ -1129,12 +1467,14 @@ def _checkpoint_job(server, job: MasterJobState, checkpoint_id: str) -> dict:
             }
             url = f"{shard.worker.base_url}/checkpoint"
             try:
+                t0 = time.time()
                 resp = _post_with_retry(
                     url,
                     lambda u=url, p=req: _http_json_post(u, p, checkpoint_timeout),
                     retries,
                     f"checkpoint shard {shard.shard_id}",
                 )
+                rpc_roundtrip_s = time.time() - t0
                 if not resp.get("ok", False):
                     raise RuntimeError(f"worker checkpoint failed shard {shard.shard_id}: {resp}")
             except Exception as ex:
@@ -1143,6 +1483,10 @@ def _checkpoint_job(server, job: MasterJobState, checkpoint_id: str) -> dict:
             centroid = np.asarray(resp.get("centroid", np.zeros(job.dim, dtype=np.float32).tolist()), dtype=np.float32)
             job.worker_centroids[shard.worker.worker_id] = centroid
             job.worker_counts[shard.worker.worker_id] = int(resp.get("active_vectors", resp.get("vectors_ingested", 0)))
+            request_handling_s = float(resp.get("request_handling_time_s", 0.0))
+            job.communication_summary["checkpoint_worker_rpc_roundtrip_s"] += rpc_roundtrip_s
+            job.communication_summary["checkpoint_worker_comm_overhead_s"] += max(0.0, rpc_roundtrip_s - request_handling_s)
+            job.communication_summary["checkpoint_worker_count"] += 1
             shard_results.append(
                 {
                     "shard_id": shard.shard_id,
@@ -1178,6 +1522,8 @@ def _checkpoint_job(server, job: MasterJobState, checkpoint_id: str) -> dict:
             "checkpoint_dir": str(checkpoint_root),
             "centers_file": str(centers_path),
             "total_vectors_ingested": int(job.total_vectors_ingested),
+            "build_elapsed_s": _build_elapsed_s(job),
+            "wall_elapsed_s": _wall_elapsed_s(job),
             "routing_epoch": int(job.routing_epoch),
             "active_workers": [shard.worker.worker_id for shard in active_shards],
             "shards": shard_results,
@@ -1207,6 +1553,8 @@ class MasterHandler(BaseHTTPRequestHandler):
             return self._handle_add_batch()
         if self.path == "/checkpoint":
             return self._handle_checkpoint()
+        if self.path == "/build_timing":
+            return self._handle_build_timing()
         if self.path == "/finalize":
             return self._handle_finalize()
         if self.path == "/shutdown":
@@ -1251,6 +1599,7 @@ class MasterHandler(BaseHTTPRequestHandler):
         )
 
     def _handle_init(self):
+        request_started = time.time()
         req = _read_json(self)
         try:
             job_id = str(req["job_id"])
@@ -1258,10 +1607,22 @@ class MasterHandler(BaseHTTPRequestHandler):
             dist = str(req.get("dist", "L2"))
             dim = int(req["dim"])
             output_dir = str(req["output_dir"])
+            value_type = str(req.get("value_type", "Float"))
             threads = int(req.get("threads", 8))
+            cef = _optional_positive_int(req.get("cef"), "cef")
+            max_check_for_refine_graph = _optional_positive_int(
+                req.get("max_check_for_refine_graph"), "max_check_for_refine_graph"
+            )
+            graph_neighborhood_scale = _optional_positive_float(
+                req.get("graph_neighborhood_scale"), "graph_neighborhood_scale"
+            )
             with_meta_index = bool(req.get("with_meta_index", False))
         except Exception as ex:
             _json_response(self, 400, {"ok": False, "error": f"invalid init payload: {ex}"})
+            return
+
+        if value_type not in {"Float", "UInt8"}:
+            _json_response(self, 400, {"ok": False, "error": f"unsupported value_type: {value_type}"})
             return
 
         job = MasterJobState(
@@ -1269,8 +1630,12 @@ class MasterHandler(BaseHTTPRequestHandler):
             dim=dim,
             algo=algo,
             dist=dist,
+            value_type=value_type,
             output_dir=output_dir,
             threads=threads,
+            cef=cef,
+            max_check_for_refine_graph=max_check_for_refine_graph,
+            graph_neighborhood_scale=graph_neighborhood_scale,
             with_meta_index=with_meta_index,
             init_time=time.time(),
         )
@@ -1298,10 +1663,12 @@ class MasterHandler(BaseHTTPRequestHandler):
                 "num_shards": len(job.shards),
                 "registered_workers": len(_snapshot_registered_workers(self.server)),
                 "routing_mode": job.routing_mode,
+                "request_total_s": max(0.0, time.time() - request_started),
             },
         )
 
     def _handle_add_batch(self):
+        request_started = time.time()
         content_len = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(content_len)
         if len(raw) < 8:
@@ -1406,6 +1773,7 @@ class MasterHandler(BaseHTTPRequestHandler):
                             "vectors_accepted": num,
                             "buffered": False,
                             "routing_mode": job.routing_mode,
+                            "request_total_s": max(0.0, time.time() - request_started),
                         },
                     )
                     return
@@ -1418,6 +1786,7 @@ class MasterHandler(BaseHTTPRequestHandler):
                         "vectors_accepted": num,
                         "buffered": True,
                         "bootstrap_buffered_vectors": job.bootstrap_vector_count,
+                        "request_total_s": max(0.0, time.time() - request_started),
                     },
                 )
                 return
@@ -1431,7 +1800,8 @@ class MasterHandler(BaseHTTPRequestHandler):
                 return
 
             try:
-                shards_touched = _forward_routed_batch(self.server, job, vectors, global_ids, normalized)
+                forward_metrics = _forward_routed_batch(self.server, job, vectors, global_ids, normalized)
+                shards_touched = int(forward_metrics.get("shards_touched", 0))
                 job.total_vectors_ingested += num
                 _maybe_activate_threshold_worker(self.server, job)
             except Exception as ex:
@@ -1449,10 +1819,26 @@ class MasterHandler(BaseHTTPRequestHandler):
                 "vectors_accepted": num,
                 "shards_touched": shards_touched,
                 "routing_mode": job.routing_mode,
+                "request_total_s": max(0.0, time.time() - request_started),
+                "master_worker_rpc_roundtrip_s": float(forward_metrics.get("worker_rpc_roundtrip_s", 0.0)),
+                "master_worker_rpc_roundtrip_max_s": float(forward_metrics.get("worker_rpc_roundtrip_max_s", 0.0)),
+                "master_worker_fanout_wall_time_s": float(forward_metrics.get("worker_fanout_wall_time_s", 0.0)),
+                "master_worker_request_handling_s": float(forward_metrics.get("worker_request_handling_s", 0.0)),
+                "master_worker_body_read_time_s": float(forward_metrics.get("worker_body_read_time_s", 0.0)),
+                "master_worker_processing_after_read_s": float(forward_metrics.get("worker_processing_after_read_s", 0.0)),
+                "master_worker_processing_after_read_max_s": float(
+                    forward_metrics.get("worker_processing_after_read_max_s", 0.0)
+                ),
+                "master_worker_apply_time_s": float(forward_metrics.get("worker_apply_time_s", 0.0)),
+                "master_worker_queue_wait_time_s": float(forward_metrics.get("worker_queue_wait_time_s", 0.0)),
+                "master_worker_comm_overhead_s": float(forward_metrics.get("worker_comm_overhead_s", 0.0)),
+                "master_worker_backpressure_sleep_s": float(forward_metrics.get("worker_backpressure_sleep_s", 0.0)),
+                "master_worker_attempts": int(forward_metrics.get("worker_attempts", 0)),
             },
         )
 
     def _handle_checkpoint(self):
+        request_started = time.time()
         req = _read_json(self)
         try:
             job_id = str(req["job_id"])
@@ -1479,9 +1865,57 @@ class MasterHandler(BaseHTTPRequestHandler):
             _json_response(self, 502, {"ok": False, "error": str(ex)})
             return
 
-        _json_response(self, 200, {"ok": True, "job_id": job_id, **record})
+        _json_response(
+            self,
+            200,
+            {
+                "ok": True,
+                "job_id": job_id,
+                "request_total_s": max(0.0, time.time() - request_started),
+                "communication_summary": dict(job.communication_summary),
+                **record,
+            },
+        )
+
+    def _handle_build_timing(self):
+        request_started = time.time()
+        req = _read_json(self)
+        try:
+            job_id = str(req["job_id"])
+            action = str(req["action"]).strip().lower()
+        except Exception as ex:
+            _json_response(self, 400, {"ok": False, "error": f"invalid build_timing payload: {ex}"})
+            return
+
+        if action not in {"pause", "resume"}:
+            _json_response(self, 400, {"ok": False, "error": "action must be 'pause' or 'resume'"})
+            return
+
+        with STATE_LOCK:
+            job = STATE.get(job_id)
+
+        if job is None:
+            _json_response(self, 404, {"ok": False, "error": "job not found"})
+            return
+
+        with job.lock:
+            changed = _pause_build_timing(job) if action == "pause" else _resume_build_timing(job)
+            payload = {
+                "ok": True,
+                "job_id": job_id,
+                "action": action,
+                "changed": changed,
+                "build_elapsed_s": _build_elapsed_s(job),
+                "wall_elapsed_s": _wall_elapsed_s(job),
+                "build_timing_paused": bool(job.build_pause_started_at is not None),
+                "build_paused_time_s": float(job.build_paused_time_s),
+                "request_total_s": max(0.0, time.time() - request_started),
+            }
+
+        _json_response(self, 200, payload)
 
     def _handle_finalize(self):
+        request_started = time.time()
         req = _read_json(self)
         try:
             job_id = str(req["job_id"])
@@ -1517,12 +1951,14 @@ class MasterHandler(BaseHTTPRequestHandler):
                 fin_req = {"job_id": job_id, "shard_id": shard.shard_id}
                 url = f"{shard.worker.base_url}/finalize"
                 try:
+                    t0 = time.time()
                     resp = _post_with_retry(
                         url,
                         lambda u=url, p=fin_req: _http_json_post(u, p, finalize_timeout),
                         retries,
                         f"finalize shard {shard.shard_id}",
                     )
+                    rpc_roundtrip_s = time.time() - t0
                     if not resp.get("ok", False):
                         raise RuntimeError(f"worker finalize failed shard {shard.shard_id}: {resp}")
                 except Exception as ex:
@@ -1535,6 +1971,10 @@ class MasterHandler(BaseHTTPRequestHandler):
                 centroid = np.asarray(resp.get("centroid", np.zeros(job.dim, dtype=np.float32).tolist()), dtype=np.float32)
                 job.worker_centroids[shard.worker.worker_id] = centroid
                 job.worker_counts[shard.worker.worker_id] = int(resp.get("active_vectors", resp.get("vectors_ingested", 0)))
+                request_handling_s = float(resp.get("request_handling_time_s", 0.0))
+                job.communication_summary["finalize_worker_rpc_roundtrip_s"] += rpc_roundtrip_s
+                job.communication_summary["finalize_worker_comm_overhead_s"] += max(0.0, rpc_roundtrip_s - request_handling_s)
+                job.communication_summary["finalize_worker_count"] += 1
 
                 shard_results.append(
                     {
@@ -1574,6 +2014,10 @@ class MasterHandler(BaseHTTPRequestHandler):
                 "job_id": job_id,
                 "shards": shard_results,
                 "centers_file": job.centers_file,
+                "build_elapsed_s": _build_elapsed_s(job),
+                "wall_elapsed_s": _wall_elapsed_s(job),
+                "request_total_s": max(0.0, time.time() - request_started),
+                "communication_summary": dict(job.communication_summary),
             },
         )
 
@@ -1621,11 +2065,21 @@ class MasterHandler(BaseHTTPRequestHandler):
                     "job_id": job_id,
                     "dim": job.dim,
                     "algo": job.algo,
+                    "value_type": job.value_type,
+                    "build_params": _build_params_payload(
+                        job.cef,
+                        job.max_check_for_refine_graph,
+                        job.graph_neighborhood_scale,
+                    ),
                     "registered_workers": len(_snapshot_registered_workers(self.server)),
                     "initialized_shards": len(job.shards),
                     "routing_mode": job.routing_mode,
                     "routing_epoch": job.routing_epoch,
                     "total_vectors_ingested": int(job.total_vectors_ingested),
+                    "build_elapsed_s": _build_elapsed_s(job),
+                    "wall_elapsed_s": _wall_elapsed_s(job),
+                    "build_timing_paused": bool(job.build_pause_started_at is not None),
+                    "build_paused_time_s": float(job.build_paused_time_s),
                     "pending_new_workers": sorted(job.pending_new_workers),
                     "bootstrap_vector_count": job.bootstrap_vector_count,
                     "reservoir_seen": job.reservoir_seen,
@@ -1648,6 +2102,7 @@ class MasterHandler(BaseHTTPRequestHandler):
                     "rebalance_history_size": len(job.rebalance_history),
                     "last_rebalance": job.rebalance_history[-1] if job.rebalance_history else None,
                     "rebalance_history": list(job.rebalance_history),
+                    "communication_summary": dict(job.communication_summary),
                     "shards": shard_info,
                 },
             )
