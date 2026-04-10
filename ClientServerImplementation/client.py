@@ -176,6 +176,8 @@ def main():
     parser.add_argument("--dist", default="L2", choices=["L2", "Cosine"])
     parser.add_argument("--value_type", default="Float", choices=["Float", "UInt8"])
     parser.add_argument("--cef", type=int, default=None, help="Optional SPTAG CEF build parameter.")
+    parser.add_argument("--tpt_number", type=int, default=None, help="Optional SPTAG TPTNumber build parameter.")
+    parser.add_argument("--tpt_leaf_size", type=int, default=None, help="Optional SPTAG TPTLeafSize build parameter.")
     parser.add_argument(
         "--max_check_for_refine_graph",
         type=int,
@@ -223,6 +225,10 @@ def main():
         raise ValueError("Only sequential client sending is supported; set --client_threads=1")
     if args.cef is not None and int(args.cef) <= 0:
         raise ValueError("--cef must be > 0")
+    if args.tpt_number is not None and int(args.tpt_number) <= 0:
+        raise ValueError("--tpt_number must be > 0")
+    if args.tpt_leaf_size is not None and int(args.tpt_leaf_size) <= 0:
+        raise ValueError("--tpt_leaf_size must be > 0")
     if args.max_check_for_refine_graph is not None and int(args.max_check_for_refine_graph) <= 0:
         raise ValueError("--max_check_for_refine_graph must be > 0")
     if args.graph_neighborhood_scale is not None and float(args.graph_neighborhood_scale) <= 0:
@@ -291,6 +297,10 @@ def main():
         }
         if args.cef is not None:
             init_payload["cef"] = int(args.cef)
+        if args.tpt_number is not None:
+            init_payload["tpt_number"] = int(args.tpt_number)
+        if args.tpt_leaf_size is not None:
+            init_payload["tpt_leaf_size"] = int(args.tpt_leaf_size)
         if args.max_check_for_refine_graph is not None:
             init_payload["max_check_for_refine_graph"] = int(args.max_check_for_refine_graph)
         if args.graph_neighborhood_scale is not None:

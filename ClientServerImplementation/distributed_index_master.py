@@ -187,11 +187,19 @@ def _optional_positive_float(value, name: str) -> float | None:
     return parsed
 
 
-def _build_params_payload(cef: int | None, max_check_for_refine_graph: int | None, graph_neighborhood_scale: float | None) -> dict:
+def _build_params_payload(
+    cef: int | None,
+    max_check_for_refine_graph: int | None,
+    graph_neighborhood_scale: float | None,
+    tpt_number: int | None,
+    tpt_leaf_size: int | None,
+) -> dict:
     return {
         "cef": cef,
         "max_check_for_refine_graph": max_check_for_refine_graph,
         "graph_neighborhood_scale": graph_neighborhood_scale,
+        "tpt_number": tpt_number,
+        "tpt_leaf_size": tpt_leaf_size,
     }
 
 
@@ -390,6 +398,8 @@ class MasterJobState:
     cef: int | None
     max_check_for_refine_graph: int | None
     graph_neighborhood_scale: float | None
+    tpt_number: int | None
+    tpt_leaf_size: int | None
     with_meta_index: bool
     shards: list[ShardInfo] = field(default_factory=list)
     finalized: bool = False
@@ -581,6 +591,8 @@ def _init_worker_for_job(
         "cef": job.cef,
         "max_check_for_refine_graph": job.max_check_for_refine_graph,
         "graph_neighborhood_scale": job.graph_neighborhood_scale,
+        "tpt_number": job.tpt_number,
+        "tpt_leaf_size": job.tpt_leaf_size,
         "dim": job.dim,
         "save_dir": save_dir,
         "with_meta_index": job.with_meta_index,
@@ -1616,6 +1628,8 @@ class MasterHandler(BaseHTTPRequestHandler):
             graph_neighborhood_scale = _optional_positive_float(
                 req.get("graph_neighborhood_scale"), "graph_neighborhood_scale"
             )
+            tpt_number = _optional_positive_int(req.get("tpt_number"), "tpt_number")
+            tpt_leaf_size = _optional_positive_int(req.get("tpt_leaf_size"), "tpt_leaf_size")
             with_meta_index = bool(req.get("with_meta_index", False))
         except Exception as ex:
             _json_response(self, 400, {"ok": False, "error": f"invalid init payload: {ex}"})
@@ -1636,6 +1650,8 @@ class MasterHandler(BaseHTTPRequestHandler):
             cef=cef,
             max_check_for_refine_graph=max_check_for_refine_graph,
             graph_neighborhood_scale=graph_neighborhood_scale,
+            tpt_number=tpt_number,
+            tpt_leaf_size=tpt_leaf_size,
             with_meta_index=with_meta_index,
             init_time=time.time(),
         )
@@ -2070,6 +2086,8 @@ class MasterHandler(BaseHTTPRequestHandler):
                         job.cef,
                         job.max_check_for_refine_graph,
                         job.graph_neighborhood_scale,
+                        job.tpt_number,
+                        job.tpt_leaf_size,
                     ),
                     "registered_workers": len(_snapshot_registered_workers(self.server)),
                     "initialized_shards": len(job.shards),

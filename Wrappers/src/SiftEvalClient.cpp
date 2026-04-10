@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -41,6 +42,7 @@ struct Args {
     std::string gt_path =
         "/home/akunte2/work/horizann/data/sift1M/sift_groundtruth.ivecs";
     std::string host = "127.0.0.1";
+    std::string value_type = "Float";
     int port = 9200;
     int K = 10;
     int max_queries = -1;   // -1 = all
@@ -55,6 +57,7 @@ void print_usage(const char* prog) {
         << "  --gt_path      PATH  (default: "
         << "/home/akunte2/work/horizann/data/sift1M/sift_groundtruth.ivecs)\n"
         << "  --host         HOST  (default: 127.0.0.1)\n"
+        << "  --value_type   TYPE  (default: Float)\n"
         << "  --port         PORT  (default: 9200)\n"
         << "  --K            K     (default: 10)\n"
         << "  --max_queries  N     (default: all)\n"
@@ -78,6 +81,8 @@ Args parse_args(int argc, char** argv) {
             args.gt_path = need_value("--gt_path");
         } else if (key == "--host") {
             args.host = need_value("--host");
+        } else if (key == "--value_type") {
+            args.value_type = need_value("--value_type");
         } else if (key == "--port") {
             args.port = std::stoi(need_value("--port"));
         } else if (key == "--K") {
@@ -358,8 +363,14 @@ void search_range(const Args& args,
 {
     if (q_start >= q_end) return;
 
+    const std::string value_type = lowercase(args.value_type);
+    if (value_type != "float" && value_type != "uint8") {
+        throw std::runtime_error("Unsupported --value_type: " + args.value_type);
+    }
+
     std::string port_str = std::to_string(args.port);
     AnnClient client(args.host.c_str(), port_str.c_str());
+    std::vector<std::uint8_t> query_u8(static_cast<std::size_t>(dim));
 
     while (!client.IsConnected()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -369,14 +380,28 @@ void search_range(const Args& args,
     for (int q = q_start; q < q_end; ++q) {
         const float* qptr = &queries[static_cast<std::size_t>(q) * dim];
 
-        ByteArray ba(
-            reinterpret_cast<std::uint8_t*>(const_cast<float*>(qptr)),
-            static_cast<std::size_t>(dim) * sizeof(float),
-            false  // do not free qptr
-        );
+        ByteArray ba;
+        const char* request_value_type = nullptr;
+        if (value_type == "uint8") {
+            for (int i = 0; i < dim; ++i) {
+                float v = std::round(qptr[i]);
+                if (v < 0.0f) v = 0.0f;
+                if (v > 255.0f) v = 255.0f;
+                query_u8[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(v);
+            }
+            ba = ByteArray(query_u8.data(), static_cast<std::size_t>(dim), false);
+            request_value_type = "UInt8";
+        } else {
+            ba = ByteArray(
+                reinterpret_cast<std::uint8_t*>(const_cast<float*>(qptr)),
+                static_cast<std::size_t>(dim) * sizeof(float),
+                false  // do not free qptr
+            );
+            request_value_type = "Float";
+        }
 
         std::shared_ptr<RemoteSearchResult> res_ptr =
-            client.Search(ba, K, "Float", true);
+            client.Search(ba, K, request_value_type, true);
 
         if (!res_ptr) {
             throw std::runtime_error("AnnClient::Search returned null result for q=" + std::to_string(q));
@@ -496,6 +521,7 @@ int main(int argc, char** argv) {
         std::cout << Q << " queries, dim=" << dim
                   << ", gt_dim=" << gt_dim
                   << ", K=" << args.K
+                  << ", value_type=" << args.value_type
                   << ", num_threads=" << args.num_threads
                   << "\n";
 

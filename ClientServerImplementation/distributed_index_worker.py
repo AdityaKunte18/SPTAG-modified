@@ -237,11 +237,19 @@ def _optional_positive_float(value, name: str) -> float | None:
     return parsed
 
 
-def _build_params_payload(cef: int | None, max_check_for_refine_graph: int | None, graph_neighborhood_scale: float | None) -> dict:
+def _build_params_payload(
+    cef: int | None,
+    max_check_for_refine_graph: int | None,
+    graph_neighborhood_scale: float | None,
+    tpt_number: int | None,
+    tpt_leaf_size: int | None,
+) -> dict:
     return {
         "cef": cef,
         "max_check_for_refine_graph": max_check_for_refine_graph,
         "graph_neighborhood_scale": graph_neighborhood_scale,
+        "tpt_number": tpt_number,
+        "tpt_leaf_size": tpt_leaf_size,
     }
 
 
@@ -262,6 +270,8 @@ def _make_index(
     cef: int | None = None,
     max_check_for_refine_graph: int | None = None,
     graph_neighborhood_scale: float | None = None,
+    tpt_number: int | None = None,
+    tpt_leaf_size: int | None = None,
 ):
     normalized_value_type = _normalize_value_type(value_type)
     index = SPTAG.AnnIndex(algo, normalized_value_type, dim)
@@ -273,6 +283,10 @@ def _make_index(
         index.SetBuildParam("MaxCheckForRefineGraph", str(int(max_check_for_refine_graph)), "Index")
     if graph_neighborhood_scale is not None:
         index.SetBuildParam("GraphNeighborhoodScale", str(float(graph_neighborhood_scale)), "Index")
+    if tpt_number is not None:
+        index.SetBuildParam("TPTNumber", str(int(tpt_number)), "Index")
+    if tpt_leaf_size is not None:
+        index.SetBuildParam("TPTLeafSize", str(int(tpt_leaf_size)), "Index")
     return index
 
 
@@ -405,6 +419,8 @@ class JobState:
     cef: int | None
     max_check_for_refine_graph: int | None
     graph_neighborhood_scale: float | None
+    tpt_number: int | None
+    tpt_leaf_size: int | None
     save_dir: str
     shard_id: int
     with_meta_index: bool
@@ -616,6 +632,8 @@ def _rebuild_index_from_store(st: JobState, batch_size: int) -> tuple[int, np.nd
         st.cef,
         st.max_check_for_refine_graph,
         st.graph_neighborhood_scale,
+        st.tpt_number,
+        st.tpt_leaf_size,
     )
     first_batch_done = False
     total = 0
@@ -827,6 +845,8 @@ class WorkerHandler(BaseHTTPRequestHandler):
                         st.cef,
                         st.max_check_for_refine_graph,
                         st.graph_neighborhood_scale,
+                        st.tpt_number,
+                        st.tpt_leaf_size,
                     ),
                     "vectors_ingested": st.vectors_ingested,
                     "active_vectors": st.local_store.active_count,
@@ -897,6 +917,8 @@ class WorkerHandler(BaseHTTPRequestHandler):
             graph_neighborhood_scale = _optional_positive_float(
                 req.get("graph_neighborhood_scale"), "graph_neighborhood_scale"
             )
+            tpt_number = _optional_positive_int(req.get("tpt_number"), "tpt_number")
+            tpt_leaf_size = _optional_positive_int(req.get("tpt_leaf_size"), "tpt_leaf_size")
             save_dir = str(req["save_dir"])
             with_meta_index = bool(req.get("with_meta_index", False))
         except Exception as ex:
@@ -920,6 +942,8 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 cef,
                 max_check_for_refine_graph,
                 graph_neighborhood_scale,
+                tpt_number,
+                tpt_leaf_size,
             ),
             algo=algo,
             dim=dim,
@@ -929,6 +953,8 @@ class WorkerHandler(BaseHTTPRequestHandler):
             cef=cef,
             max_check_for_refine_graph=max_check_for_refine_graph,
             graph_neighborhood_scale=graph_neighborhood_scale,
+            tpt_number=tpt_number,
+            tpt_leaf_size=tpt_leaf_size,
             save_dir=save_dir,
             shard_id=shard_id,
             with_meta_index=with_meta_index,
@@ -1546,6 +1572,8 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     st.cef,
                     st.max_check_for_refine_graph,
                     st.graph_neighborhood_scale,
+                    st.tpt_number,
+                    st.tpt_leaf_size,
                 ),
                 "memory": _memory_snapshot(),
                 "memory_history_size": len(st.memory_history),
@@ -1664,6 +1692,13 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 "batch_insert_summary": _batch_insert_summary(st),
                 "batch_insert_history_size": len(st.batch_insert_history),
                 "batch_insert_history": list(st.batch_insert_history),
+                "build_params": _build_params_payload(
+                    st.cef,
+                    st.max_check_for_refine_graph,
+                    st.graph_neighborhood_scale,
+                    st.tpt_number,
+                    st.tpt_leaf_size,
+                ),
                 "memory": _memory_snapshot(),
                 "memory_history_size": len(st.memory_history),
                 "last_memory": st.memory_history[-1] if st.memory_history else None,
