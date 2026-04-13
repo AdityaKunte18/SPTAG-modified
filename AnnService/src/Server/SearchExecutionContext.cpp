@@ -10,7 +10,7 @@ using namespace SPTAG::Service;
 
 SearchExecutionContext::SearchExecutionContext(const std::shared_ptr<const ServiceSettings> &p_serviceSettings)
     : c_serviceSettings(p_serviceSettings), m_vectorDimension(0), m_inputValueType(VectorValueType::Undefined),
-      m_extractMetadata(true), m_resultNum(p_serviceSettings->m_defaultMaxResultNumber)
+      m_extractMetadata(true), m_resultNum(p_serviceSettings->m_defaultMaxResultNumber), m_maxCheck(0)
 {
 }
 
@@ -62,6 +62,14 @@ ErrorCode SearchExecutionContext::ExtractOption()
         else if (Helper::StrUtils::StrEqualIgnoreCase(optionPair.first, "resultnum"))
         {
             Helper::Convert::ConvertStringTo<SizeType>(optionPair.second, m_resultNum);
+        }
+        else if (Helper::StrUtils::StrEqualIgnoreCase(optionPair.first, "maxcheck"))
+        {
+            int maxCheck = 0;
+            if (Helper::Convert::ConvertStringTo<int>(optionPair.second, maxCheck) && maxCheck > 0)
+            {
+                m_maxCheck = maxCheck;
+            }
         }
     }
 
@@ -155,4 +163,9 @@ const SizeType SearchExecutionContext::GetResultNum() const
 const bool SearchExecutionContext::GetExtractMetadata() const
 {
     return m_extractMetadata;
+}
+
+const int SearchExecutionContext::GetMaxCheck() const
+{
+    return m_maxCheck;
 }

@@ -61,6 +61,7 @@ void SearchExecutor::ExecuteInternal()
 
     QueryResult query(m_executionContext->GetVector().Data(), m_executionContext->GetResultNum(),
                       m_executionContext->GetExtractMetadata());
+    const int maxCheck = m_executionContext->GetMaxCheck();
 
     for (const auto &vectorIndex : m_selectedIndex)
     {
@@ -71,7 +72,18 @@ void SearchExecutor::ExecuteInternal()
         }
 
         query.Reset();
-        if (ErrorCode::Success == vectorIndex->SearchIndex(query))
+        ErrorCode searchStatus = ErrorCode::Undefined;
+        if (maxCheck > 0)
+        {
+            searchStatus = vectorIndex->SearchIndexWithFilter(
+                query, std::function<bool(const ByteArray &)>(), maxCheck);
+        }
+        else
+        {
+            searchStatus = vectorIndex->SearchIndex(query);
+        }
+
+        if (ErrorCode::Success == searchStatus)
         {
             m_executionContext->AddResults(vectorIndex->GetIndexName(), query);
         }

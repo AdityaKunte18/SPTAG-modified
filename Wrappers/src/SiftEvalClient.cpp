@@ -47,6 +47,8 @@ struct Args {
     int K = 10;
     int max_queries = -1;   // -1 = all
     int num_threads = 8;    // number of worker threads
+    int aggregator_top_k = 0; // 0 = use aggregator config
+    int max_check = 0;        // 0 = use worker config
 };
 
 void print_usage(const char* prog) {
@@ -61,7 +63,9 @@ void print_usage(const char* prog) {
         << "  --port         PORT  (default: 9200)\n"
         << "  --K            K     (default: 10)\n"
         << "  --max_queries  N     (default: all)\n"
-        << "  --num_threads  T     (default: 8)\n";
+        << "  --num_threads  T     (default: 8)\n"
+        << "  --aggregator_top_k N (default: aggregator config)\n"
+        << "  --max_check    N     (default: worker config)\n";
 }
 
 Args parse_args(int argc, char** argv) {
@@ -91,6 +95,10 @@ Args parse_args(int argc, char** argv) {
             args.max_queries = std::stoi(need_value("--max_queries"));
         } else if (key == "--num_threads") {
             args.num_threads = std::stoi(need_value("--num_threads"));
+        } else if (key == "--aggregator_top_k") {
+            args.aggregator_top_k = std::stoi(need_value("--aggregator_top_k"));
+        } else if (key == "--max_check") {
+            args.max_check = std::stoi(need_value("--max_check"));
         } else if (key == "--help" || key == "-h") {
             print_usage(argv[0]);
             std::exit(0);
@@ -102,6 +110,12 @@ Args parse_args(int argc, char** argv) {
     }
     if (args.num_threads <= 0) {
         args.num_threads = 1;
+    }
+    if (args.aggregator_top_k < 0) {
+        throw std::runtime_error("--aggregator_top_k must be >= 0");
+    }
+    if (args.max_check < 0) {
+        throw std::runtime_error("--max_check must be >= 0");
     }
     return args;
 }
@@ -376,6 +390,16 @@ void search_range(const Args& args,
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     client.SetTimeoutMilliseconds(20000);
+    const std::string aggregator_top_k =
+        args.aggregator_top_k > 0 ? std::to_string(args.aggregator_top_k) : "";
+    const std::string max_check =
+        args.max_check > 0 ? std::to_string(args.max_check) : "";
+    if (!aggregator_top_k.empty()) {
+        client.SetSearchParam("aggregatortopk", aggregator_top_k.c_str());
+    }
+    if (!max_check.empty()) {
+        client.SetSearchParam("maxcheck", max_check.c_str());
+    }
 
     for (int q = q_start; q < q_end; ++q) {
         const float* qptr = &queries[static_cast<std::size_t>(q) * dim];
@@ -523,6 +547,8 @@ int main(int argc, char** argv) {
                   << ", K=" << args.K
                   << ", value_type=" << args.value_type
                   << ", num_threads=" << args.num_threads
+                  << ", aggregator_top_k=" << args.aggregator_top_k
+                  << ", max_check=" << args.max_check
                   << "\n";
 
         const int K = args.K;

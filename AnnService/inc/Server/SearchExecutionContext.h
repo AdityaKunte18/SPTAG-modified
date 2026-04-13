@@ -53,6 +53,8 @@ public:
 
     const bool GetExtractMetadata() const;
 
+    const int GetMaxCheck() const;
+
 private:
     const std::shared_ptr<const ServiceSettings> c_serviceSettings;
 
@@ -71,6 +73,8 @@ private:
     bool m_extractMetadata;
 
     SizeType m_resultNum;
+
+    int m_maxCheck;
 };
 
 } // namespace Server

@@ -172,15 +172,41 @@ void AggregatorService::SearchRequestHanlder(Socket::ConnectionID p_localConnect
     std::vector<Socket::ConnectionID> remoteServers;
     remoteServers.reserve(context->GetRemoteServers().size());
 
-    if (context->GetSettings()->m_topK > 0 && context->GetRemoteServers().size() == context->GetCenters()->Count())
+    Socket::RemoteQuery remoteQuery;
+    Service::QueryParser queryParser;
+    bool queryParsed = false;
+    SizeType effectiveTopK = context->GetSettings()->m_topK;
+    if (0 != p_packet.Header().m_bodyLength)
     {
-        Socket::RemoteQuery remoteQuery;
         remoteQuery.Read(p_packet.Body());
+        queryParsed = (queryParser.Parse(remoteQuery.m_queryString, "|") == ErrorCode::Success);
+        if (queryParsed)
+        {
+            for (const auto &optionPair : queryParser.GetOptions())
+            {
+                if (Helper::StrUtils::StrEqualIgnoreCase(optionPair.first, "aggregatortopk"))
+                {
+                    SizeType overrideTopK = 0;
+                    if (Helper::Convert::ConvertStringTo<SizeType>(optionPair.second, overrideTopK) && overrideTopK > 0)
+                    {
+                        effectiveTopK = overrideTopK;
+                    }
+                }
+            }
+        }
+    }
 
-        Service::QueryParser queryParser;
-        queryParser.Parse(remoteQuery.m_queryString, "|");
+    const SizeType remoteServerCount = static_cast<SizeType>(context->GetRemoteServers().size());
+    if (effectiveTopK > remoteServerCount)
+    {
+        effectiveTopK = remoteServerCount;
+    }
+
+    if (effectiveTopK > 0 && queryParsed && nullptr != context->GetCenters() &&
+        context->GetRemoteServers().size() == context->GetCenters()->Count())
+    {
         ByteArray vector;
-        size_t vectorSize;
+        size_t vectorSize = 0;
         SizeType vectorDimension = 0;
         std::vector<BasicResult> servers;
         switch (context->GetSettings()->m_valueType)
@@ -214,7 +240,12 @@ void AggregatorService::SearchRequestHanlder(Socket::ConnectionID p_localConnect
         }
         std::sort(servers.begin(), servers.end(),
                   [](const BasicResult &a, const BasicResult &b) { return a.Dist < b.Dist; });
-        for (int i = 0; i < context->GetSettings()->m_topK; i++)
+        SizeType selectedServerCount = effectiveTopK;
+        if (selectedServerCount > static_cast<SizeType>(servers.size()))
+        {
+            selectedServerCount = static_cast<SizeType>(servers.size());
+        }
+        for (SizeType i = 0; i < selectedServerCount; i++)
         {
             auto &server = context->GetRemoteServers().at(servers[i].VID);
             if (RemoteMachineStatus::Connected != server->m_status)

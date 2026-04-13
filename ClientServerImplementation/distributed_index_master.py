@@ -1427,17 +1427,24 @@ def _maybe_start_rebalance(server, job: MasterJobState) -> bool:
     return True
 
 
-def _write_centers_file(path: Path, centroids_by_worker: dict[int, np.ndarray], dim: int) -> None:
+def _write_centers_file(path: Path, centroids_by_worker: dict[int, np.ndarray], dim: int, value_type: str) -> None:
     ordered_ids = sorted(centroids_by_worker)
     matrix = np.vstack([centroids_by_worker[worker_id] for worker_id in ordered_ids]).astype(np.float32, copy=False)
     if matrix.ndim != 2:
         raise ValueError(f"invalid centers matrix shape: {matrix.shape}")
     if matrix.shape[1] != dim:
         raise ValueError(f"center dim mismatch: matrix has {matrix.shape[1]}, expected {dim}")
+    if value_type == "Float":
+        serialized = np.ascontiguousarray(matrix, dtype=np.float32)
+    elif value_type == "UInt8":
+        # Match the worker/query dtype the aggregator will use during shard routing.
+        serialized = np.ascontiguousarray(np.clip(np.rint(matrix), 0, 255), dtype=np.uint8)
+    else:
+        raise ValueError(f"unsupported centers value_type: {value_type}")
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as f:
         f.write(struct.pack("<ii", int(matrix.shape[0]), int(matrix.shape[1])))
-        f.write(np.ascontiguousarray(matrix, dtype=np.float32).tobytes())
+        f.write(serialized.tobytes())
 
 
 def _wait_until_job_stable_for_snapshot(server, job: MasterJobState) -> None:
@@ -1527,7 +1534,7 @@ def _checkpoint_job(server, job: MasterJobState, checkpoint_id: str) -> dict:
             if shard.worker.worker_id in job.worker_centroids
         }
         centers_path = checkpoint_root / "centers"
-        _write_centers_file(centers_path, active_centroids, job.dim)
+        _write_centers_file(centers_path, active_centroids, job.dim, job.value_type)
 
         record = {
             "checkpoint_id": checkpoint_id,
@@ -2018,7 +2025,7 @@ class MasterHandler(BaseHTTPRequestHandler):
                 )
 
             centers_path = Path(job.output_dir) / "centers"
-            _write_centers_file(centers_path, job.worker_centroids, job.dim)
+            _write_centers_file(centers_path, job.worker_centroids, job.dim, job.value_type)
             job.centers_file = str(centers_path)
             job.finalized = True
 
