@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local single-host runner for the 10-worker SPTAG milestone on Ubuntu.
+"""Local single-host runner for SPTAG experiments on Ubuntu.
 
 This script is designed to live inside ``SPTAG-modified`` and run directly on
 the Ubuntu machine. It avoids the SSH control plane entirely and launches all
@@ -160,6 +160,8 @@ def _search_checkpoint_timing_payload(
     start_snapshot: Dict[str, Any],
     end_snapshot: Dict[str, Any],
     status: str,
+    completed_parameter_set_count: int | None = None,
+    failed_parameter_sets: Sequence[str] | None = None,
     failed_parameter_set: str | None = None,
     error: str | None = None,
 ) -> Dict[str, Any]:
@@ -183,6 +185,13 @@ def _search_checkpoint_timing_payload(
             6,
         ),
     }
+    if completed_parameter_set_count is not None:
+        payload["completed_parameter_set_count"] = int(completed_parameter_set_count)
+        payload["failed_parameter_set_count"] = max(
+            0, int(parameter_set_count) - int(completed_parameter_set_count)
+        )
+    if failed_parameter_sets:
+        payload["failed_parameter_sets"] = [str(value) for value in failed_parameter_sets]
     if failed_parameter_set:
         payload["failed_parameter_set"] = str(failed_parameter_set)
     if error:
@@ -305,10 +314,14 @@ def _checkpoint_gt_filename(checkpoint_id: int) -> str:
 
 
 def _default_base_path(args: argparse.Namespace) -> Path:
+    if args.base_path:
+        return _expand(args.base_path)
     return _expand(args.data_root) / "bigann_base.bvecs"
 
 
 def _default_query_path(args: argparse.Namespace) -> Path:
+    if args.query_path:
+        return _expand(args.query_path)
     return _expand(args.data_root) / "bigann_query.bvecs"
 
 
@@ -777,16 +790,18 @@ def _start_search_services(
         log_path = _log_dir(args) / f"search_worker_{worker_id}_{checkpoint_id}.log"
         _tmux_launch(session_name, _build_search_worker_command(args, ini_path, log_path))
 
-    time.sleep(float(args.search_after_workers_sec))
+    for worker in active_workers:
+        port = int(args.search_worker_base_port) + int(worker["worker_id"]) - 1
+        _wait_for_port("127.0.0.1", port, timeout_s=float(args.search_start_timeout_sec))
+
+    if float(args.search_after_workers_sec) > 0:
+        time.sleep(float(args.search_after_workers_sec))
 
     _write_search_aggregator_ini(args, checkpoint_id=checkpoint_id, active_workers=active_workers)
     aggregator_log = _log_dir(args) / f"aggregator_{checkpoint_id}.log"
     _tmux_launch(session_name, _build_search_aggregator_command(args, aggregator_log))
 
     _wait_for_port("127.0.0.1", int(args.search_master_port), timeout_s=float(args.search_start_timeout_sec))
-    for worker in active_workers:
-        port = int(args.search_worker_base_port) + int(worker["worker_id"]) - 1
-        _wait_for_port("127.0.0.1", port, timeout_s=float(args.search_start_timeout_sec))
 
     if float(args.search_after_master_sec) > 0:
         time.sleep(float(args.search_after_master_sec))
@@ -843,6 +858,8 @@ def _run_search_sweep(args: argparse.Namespace, *, checkpoint_id: int, active_wo
     search_status = "success"
     search_error = None
     failed_parameter_set = None
+    failed_parameter_sets: List[str] = []
+    completed_parameter_set_count = 0
     try:
         _start_search_services(args, checkpoint_id=checkpoint_id, active_workers=active_workers)
         try:
@@ -861,6 +878,9 @@ def _run_search_sweep(args: argparse.Namespace, *, checkpoint_id: int, active_wo
                     },
                 )
 
+                parameter_status = "success"
+                parameter_error = None
+                completed_repetitions = 0
                 for repetition in range(1, int(args.search_repetitions) + 1):
                     log_path = run_dir / f"run_{repetition:02d}.log"
                     command = _build_search_client_command(
@@ -869,7 +889,32 @@ def _run_search_sweep(args: argparse.Namespace, *, checkpoint_id: int, active_wo
                         aggregator_top_k=int(values["aggregator.top_k"]),
                         max_check=int(values["index.max_check"]),
                     )
-                    _run_logged(command, log_path, timeout=int(args.search_run_timeout))
+                    try:
+                        _run_logged(command, log_path, timeout=int(args.search_run_timeout))
+                        completed_repetitions = repetition
+                    except Exception as ex:
+                        parameter_status = "failed"
+                        parameter_error = str(ex)
+                        if parameter_set["run_token"] not in failed_parameter_sets:
+                            failed_parameter_sets.append(parameter_set["run_token"])
+                        search_status = "completed_with_failures"
+                        break
+                _write_json(
+                    run_dir / "parameter_set_status.json",
+                    {
+                        "checkpoint_id": checkpoint_id,
+                        "run_token": parameter_set["run_token"],
+                        "values": values,
+                        "status": parameter_status,
+                        "requested_repetitions": int(args.search_repetitions),
+                        "completed_repetitions": int(completed_repetitions),
+                        "error": parameter_error,
+                    },
+                )
+                if parameter_status == "failed":
+                    failed_parameter_set = None
+                    continue
+                completed_parameter_set_count += 1
                 failed_parameter_set = None
         finally:
             _stop_search_services(args, checkpoint_id)
@@ -892,6 +937,8 @@ def _run_search_sweep(args: argparse.Namespace, *, checkpoint_id: int, active_wo
                 start_snapshot=search_timing_start,
                 end_snapshot=search_timing_end,
                 status=search_status,
+                completed_parameter_set_count=completed_parameter_set_count,
+                failed_parameter_sets=failed_parameter_sets,
                 failed_parameter_set=failed_parameter_set,
                 error=search_error,
             ),
@@ -908,6 +955,10 @@ def _run_all(args: argparse.Namespace) -> None:
     if args.finalize_after_run:
         payload = _finalize(args, run_id)
         print(json.dumps(payload, indent=2, sort_keys=True))
+
+    if args.stop_services_after_run:
+        _stop_all_search_services(args)
+        _stop_build_services(args)
 
     print("artifacts:", _artifacts_root(args, run_id))
 
@@ -935,12 +986,14 @@ def _run_build_sequence(
 ) -> Dict[str, Any] | None:
     build_phases, search_checkpoints = _phase_plan(args)
     checkpoint_set = set(search_checkpoints)
-    previous_total = 0
+    previous_total = int(getattr(args, "resume_from_point", 0) or 0)
+    if previous_total < 0:
+        raise ValueError("resume_from_point must be >= 0")
     last_status: Dict[str, Any] | None = None
 
     for phase_total in build_phases:
         if phase_total <= previous_total:
-            raise ValueError("build phases must be strictly increasing")
+            continue
         status = _build_phase(
             args,
             start_point=previous_total,
@@ -982,11 +1035,27 @@ def _add_shared_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo", default="/home/akunte2/work/horizann/SPTAG-modified")
     parser.add_argument("--release-dir", default="")
     parser.add_argument("--data-root", default="/srv/local/data/anns_data/sift1b")
+    parser.add_argument(
+        "--base-path",
+        default="",
+        help="Optional explicit dataset base-vector path. Defaults to <data-root>/bigann_base.bvecs.",
+    )
+    parser.add_argument(
+        "--query-path",
+        default="",
+        help="Optional explicit query-vector path. Defaults to <data-root>/bigann_query.bvecs.",
+    )
     parser.add_argument("--python", default="python3")
     parser.add_argument("--session-name", default="sptag-local-single-host")
     parser.add_argument("--log-dir", default="~/logs/sptag-local-single-host")
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--job-id", default="sptag_sift1b_local_single_host")
+    parser.add_argument(
+        "--resume-from-point",
+        type=int,
+        default=0,
+        help="Resume build sequencing from an already-ingested global point count. Phases at or below this value are skipped.",
+    )
     parser.add_argument("--master-port", type=int, default=18079)
     parser.add_argument("--worker-base-port", type=int, default=18080)
     parser.add_argument("--num-workers", type=int, default=10)
@@ -1037,6 +1106,11 @@ def _add_shared_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--master-start-timeout-sec", type=float, default=30.0)
     parser.add_argument("--client-phase-timeout", type=int, default=86400)
     parser.add_argument("--finalize-after-run", action="store_true")
+    parser.add_argument(
+        "--stop-services-after-run",
+        action="store_true",
+        help="Stop build/search tmux sessions after a successful run-all or run-build completes.",
+    )
     parser.add_argument("--run-search", action="store_true")
     parser.add_argument("--search-master-port", type=int, default=29200)
     parser.add_argument("--search-worker-base-port", type=int, default=29100)
@@ -1108,9 +1182,15 @@ def main() -> int:
         return 0
     if args.command == "run-build":
         run_id = _timestamp()
-        status = _run_build_sequence(args, run_id=run_id, include_search=False)
+        status = _run_build_sequence(args, run_id=run_id, include_search=bool(args.run_search))
         if status is not None:
             _print_status_summary(status)
+        if args.finalize_after_run:
+            payload = _finalize(args, run_id)
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        if args.stop_services_after_run:
+            _stop_all_search_services(args)
+            _stop_build_services(args)
         return 0
     if args.command == "run-search":
         status = _master_status(args)
